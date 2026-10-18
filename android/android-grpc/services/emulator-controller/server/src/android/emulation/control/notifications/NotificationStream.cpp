@@ -1,0 +1,367 @@
+// Copyright (C) 2023 The Android Open Source Project
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+#include "android/emulation/control/notifications/NotificationStream.h"
+
+#include <assert.h>
+#include <cstdint>
+
+#include "aemu/base/EventNotificationSupport.h"
+#include "android/avd/info.h"
+#include "android/console.h"
+#include "android/emulation/control/BootCompletionHandler.h"
+#include "android/emulation/control/utils/TypeConversion.h"
+#include "android/hw-sensors.h"
+#include "android/hw-xrlights.h"
+#include "android/utils/debug.h"
+#include "android/xr/XrService.h"
+#include "host-common/MultiDisplay.h"
+
+#define DEBUG 0
+/* set  for very verbose debugging */
+#ifndef DEBUG
+#define DD(...) (void)0
+#else
+#define DD(...) dinfo(__VA_ARGS__)
+#endif
+
+namespace xr_service = android::xr::xr_service;
+
+namespace android {
+namespace emulation {
+namespace control {
+
+const int kXrUserLedId = 1;
+const int kXrWorldLedId = 2;
+
+
+void handleXrOptionsEvent(void* user_data,
+                          const xr_emulator_proto::EmulatorResponse& response);
+
+NotificationStream::NotificationStream(VirtualSceneCamera* camera,
+                                       const AndroidConsoleAgents* agents)
+    : mCamera(camera), mAgents(agents) {}
+
+std::optional<Notification> NotificationStream::getDisplayNotificationEvent() {
+    if (!mAgents || !mAgents->multi_display ||
+        !mAgents->multi_display->getMultiDisplay) {
+        return std::nullopt;
+    }
+    Notification event;
+
+    auto eventDetails =
+            event.mutable_displayconfigurationschangednotification();
+    auto displayConfig = eventDetails->mutable_displayconfigurations();
+
+    for (int i = 0; i < MultiDisplay::s_maxNumMultiDisplay; i++) {
+        uint32_t width = 0, height = 0, dpi = 0, flags = 0;
+        bool enabled = false;
+        bool receivedDisplayStatus = mAgents->multi_display->getMultiDisplay(
+                i, nullptr, nullptr, &width, &height, &dpi, &flags, &enabled);
+
+        // Workaround for the fact that MultiDisplay is currently not atomic.
+        // This will make sure we will not include partially created/configured
+        // displays in the event (See b/290831895).
+        bool isPartiallyCreatedEvent = width == 0 && height == 0 && dpi == 0;
+
+        uint32_t cb = 0;
+        mAgents->multi_display->getDisplayColorBuffer(i, &cb);
+        bool isActive = (i == 0) || (cb != 0);
+
+        if (receivedDisplayStatus && !isPartiallyCreatedEvent && isActive) {
+            auto cfg = displayConfig->add_displays();
+            cfg->set_width(width);
+            cfg->set_height(height);
+            cfg->set_dpi(dpi);
+            cfg->set_display(i);
+            cfg->set_flags(flags);
+
+            const bool is_pixel_fold = android_foldable_is_pixel_fold();
+            if (is_pixel_fold)
+                break;
+        }
+    }
+
+    displayConfig->set_maxdisplays(android::MultiDisplay::s_maxNumMultiDisplay);
+    displayConfig->set_userconfigurable(avdInfo_maxMultiDisplayEntries());
+
+    DD("Display notification event: %s", event.ShortDebugString().c_str());
+    return event;
+}
+
+std::optional<Notification> NotificationStream::getBootedNotificationEvent() {
+    Notification event;
+    if (!BootCompletionHandler::get()->hasBooted()) {
+        DD("Not yet booted");
+        return std::nullopt;
+    }
+
+    auto eventDetails = event.mutable_booted();
+    eventDetails->set_time(BootCompletionHandler::get()->bootTime().count());
+
+    DD("Booted notification event: %s", event.ShortDebugString().c_str());
+    return event;
+}
+
+std::optional<Notification> NotificationStream::getCameraNotificationEvent() {
+    if (!mCamera) {
+        return std::nullopt;
+    }
+    Notification event;
+    auto eventDetails = event.mutable_cameranotification();
+
+    // Camera is currently always associated with display 0
+    eventDetails->set_display(0);
+    eventDetails->set_active(mCamera->isConnected());
+
+    assert(event.has_cameranotification());
+
+    DD("Camera notification event: %s", event.ShortDebugString().c_str());
+    return event;
+}
+
+std::optional<Notification> NotificationStream::getPostureNotificationEvent() {
+    Notification event;
+    static_assert((int)POSTURE_MAX ==
+                  ::android::emulation::control::Posture_PostureValue::
+                          Posture_PostureValue_POSTURE_MAX);
+    auto currentPosture =
+            static_cast<FoldablePostures>(android_foldable_get_posture());
+
+    if (currentPosture == POSTURE_UNKNOWN || currentPosture == POSTURE_MAX) {
+        VERBOSE_INFO(grpc,
+                     "Received bad foldable posture when trying to send "
+                     "gRPC notification, posture "
+                     "value: %d",
+                     currentPosture);
+        return std::nullopt;
+    }
+    event.mutable_posture()->set_value(
+            static_cast< ::android::emulation::control::Posture_PostureValue>(
+                    currentPosture));
+
+    DD("Posture notification event: %s", event.ShortDebugString().c_str());
+    return event;
+}
+
+std::optional<Notification> NotificationStream::getXrOptionsNotificationEvent() {
+    Notification event;
+    android::emulation::control::XrOptions* options = event.mutable_xroptions();
+    xr_emulator_proto::XrOptions guestOptions =
+            xr_service::retrieveXrOptionsCache();
+    *options = toHostXrOptions(guestOptions);
+    return event;
+}
+
+std::optional<Notification>
+NotificationStream::getMicrophoneStateNotificationEvent(bool allow) {
+    Notification event;
+
+    event.mutable_microphonestate()->set_realaudioenabled(allow);
+    return event;
+}
+
+std::optional<Notification>
+NotificationStream::getDisplayPowerModeNotificationEvent(
+        uint32_t displayId,
+        DisplayPowerMode powerMode) {
+    Notification event;
+    auto* powerModeNotification = event.mutable_displaypowermode();
+    powerModeNotification->set_display(displayId);
+    powerModeNotification->set_power_mode(
+            static_cast<DisplayPowerModeNotification_PowerMode>(powerMode));
+    return event;
+}
+
+NotificationStreamWriter* NotificationStream::notificationStream() {
+    if (!mRegisteredListeners.test_and_set()) {
+        registerListeners();
+    }
+
+    auto stream = new NotificationStreamWriter(&mNotificationListeners);
+    stream->eventArrived(getCameraNotificationEvent());
+    stream->eventArrived(getPostureNotificationEvent());
+    stream->eventArrived(getBootedNotificationEvent());
+    if (mAgents && mAgents->vm && mAgents->vm->isRealAudioAllowed) {
+        stream->eventArrived(getMicrophoneStateNotificationEvent(
+                mAgents->vm->isRealAudioAllowed()));
+    }
+    if (android_is_xr_mode()) {
+        stream->eventArrived(getXrOptionsNotificationEvent());
+    }
+    stream->eventArrived(getDisplayNotificationEvent());
+    if (mAgents && mAgents->multi_display &&
+        mAgents->multi_display->getDisplayPowerMode) {
+        for (uint32_t i = 0; i < MultiDisplay::s_maxNumMultiDisplay; i++) {
+            uint32_t mode = 0;
+            if (mAgents->multi_display->getDisplayPowerMode(i, &mode) == 0) {
+                stream->eventArrived(getDisplayPowerModeNotificationEvent(
+                        i, static_cast<DisplayPowerMode>(mode)));
+            }
+        }
+    }
+    return stream;
+}
+
+static void brightness_forwarder(void* opaque,
+                                 const char* light,
+                                 int brightness) {
+    NotificationEventChangeSupport* notificationListeners =
+            reinterpret_cast<NotificationEventChangeSupport*>(opaque);
+    Notification event;
+    auto bv = event.mutable_brightness();
+
+    std::string name = light;
+    if (name == "lcd_backlight") {
+        bv->set_target(BrightnessValue::LCD);
+    } else if (name == "keyboard_backlight") {
+        bv->set_target(BrightnessValue::KEYBOARD);
+    } else if (name == "button_backlight") {
+        bv->set_target(BrightnessValue::BUTTON);
+    }
+
+    bv->set_value(brightness);
+    notificationListeners->fireEvent(event);
+}
+
+static void led_forwarder(void* opaque,
+                          const AndroidHwXrLedEvent* event) {
+    NotificationEventChangeSupport* notificationListeners =
+            reinterpret_cast<NotificationEventChangeSupport*>(opaque);
+    Notification streamEvent;
+    auto ledIndicator = streamEvent.mutable_ledindicator();
+    ledIndicator->set_id(event->lightid);
+
+    if (kXrUserLedId == event->lightid) {
+        ledIndicator->set_facing(LedIndicator::INSIDE);
+    } else if (kXrWorldLedId == event->lightid) {
+        ledIndicator->set_facing(LedIndicator::OUTSIDE);
+    } else {
+        DD("Got unknown Led Indicator ID %d in Notification Stream", event->lightid);
+    }
+
+    if (0 == event->lightcolor) {
+        ledIndicator->set_state(LedIndicator::OFF);
+    } else {
+        ledIndicator->set_state(LedIndicator::ON);
+    }
+
+    ledIndicator->set_color(event->lightcolor);
+    notificationListeners->fireEvent(streamEvent);
+}
+
+
+void NotificationStream::registerListeners() {
+    // Register event listeners.
+    if (mCamera) {
+        mCamera->registerOnce([&](auto state) {
+            mNotificationListeners.fireEvent(getCameraNotificationEvent());
+        });
+    }
+
+    // TODO(jansene): This assumes we close down the event handler system after
+    // qemu stops!
+    if (mAgents) {
+        if (mAgents->hw_control && mAgents->hw_control->setCallbacks) {
+            static const AndroidHwControlFuncs sCallbacks = {
+                    .light_brightness = brightness_forwarder};
+            mAgents->hw_control->setCallbacks(&mNotificationListeners,
+                                              &sCallbacks);
+        }
+
+        // Register Led Indicator event listeners.
+        if (mAgents->hw_xr_led && mAgents->hw_xr_led->setCallbacks) {
+            static const AndroidHwXrLedFuncs sLedCallbacks = {
+                    .led_forwarder = led_forwarder};
+            mAgents->hw_xr_led->setCallbacks(&mNotificationListeners,
+                                             &sLedCallbacks);
+        }
+
+        if (mAgents->vm && mAgents->vm->getRealAudioEventListener) {
+            auto microphoneStatePublisher =
+                    static_cast<base::EventNotificationSupport<bool>*>(
+                            mAgents->vm->getRealAudioEventListener());
+            if (microphoneStatePublisher) {
+                microphoneStatePublisher->registerOnce([&](bool allow) {
+                    mNotificationListeners.fireEvent(
+                            getMicrophoneStateNotificationEvent(allow));
+                });
+            }
+        }
+
+        if (mAgents->multi_display &&
+            mAgents->multi_display->getDisplayPowerModeEventListener) {
+            auto powerModePublisher =
+                    static_cast<base::EventNotificationSupport<
+                            DisplayPowerModeChangeEvent>*>(
+                            mAgents->multi_display
+                                    ->getDisplayPowerModeEventListener());
+            if (powerModePublisher) {
+                powerModePublisher->registerOnce(
+                        [this](const DisplayPowerModeChangeEvent& evt) {
+                            mNotificationListeners.fireEvent(
+                                    getDisplayPowerModeNotificationEvent(
+                                            evt.displayId, evt.powerMode));
+                        });
+            }
+        }
+    }
+
+    if (auto md = MultiDisplay::getInstance()) {
+        md->registerOnce([&](const android::DisplayChangeEvent state) {
+            DD("Displaychange event: %d", state.change);
+            mNotificationListeners.fireEvent(getDisplayNotificationEvent());
+        });
+    }
+    if (auto foldableListener =
+                static_cast<base::EventNotificationSupport<FoldablePostures>*>(
+                        android_get_posture_listener())) {
+        foldableListener->registerOnce([&](auto state) {
+            mNotificationListeners.fireEvent(getPostureNotificationEvent());
+        });
+    }
+    if (auto bootHandler = BootCompletionHandler::get()) {
+        bootHandler->registerOnce([&](auto completed) {
+            mNotificationListeners.fireEvent(getBootedNotificationEvent());
+        });
+    }
+
+    xr_service::registerCallback(handleXrOptionsEvent, this);
+}
+
+void handleXrOptionsEvent(void* user_data,
+                          const xr_emulator_proto::EmulatorResponse& response) {
+    NotificationStream* notificationStream =
+            static_cast<NotificationStream*>(user_data);
+
+    if (response.response_case() !=
+        xr_emulator_proto::EmulatorResponse::kXrOptions) {
+        return;
+    }
+
+    Notification event;
+    android::emulation::control::XrOptions* options = event.mutable_xroptions();
+    *options = toHostXrOptions(response.xr_options());
+    notificationStream->mNotificationListeners.fireEvent(event);
+}
+
+NotificationStream::~NotificationStream() {
+    // Unset the XR lights callback for this instance to prevent Use-After-Free
+    if (mAgents && mAgents->hw_xr_led) {
+        android_hw_xrlights_unset(&mNotificationListeners);
+    }
+}
+
+}  // namespace control
+}  // namespace emulation
+}  // namespace android

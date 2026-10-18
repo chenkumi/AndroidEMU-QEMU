@@ -1,0 +1,84 @@
+{
+  // Use IntelliSense to learn about possible attributes.
+  // Hover to view descriptions of existing attributes.
+  // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Launch Emulator",
+      "type": "lldb",
+      "symbolSearchPath": "${workspaceFolder}/objs/build/debug_info;${env:VK_SDK_PATH}/bin",
+      "request": "launch",
+      "program": "${workspaceFolder}/objs/emulator",
+      "cwd": "${workspaceFolder}/objs",
+      "args": [
+        "-verbose",
+        "-avd",
+        "V",
+        "-fishtank",
+        "default",
+      ],
+      "env": {
+        "ASAN_OPTIONS": "detect_leaks=0:detect_container_overflow=0:detect_odr_violation=0:symbolize=1",
+        "ANDROID_EMUGL_VERBOSE": "1",
+        "ANDROID_EMUGL_LOG_COLORS": "1",
+        "ANDROID_EMULATOR_WAIT_TIME_BEFORE_KILL": "3",
+      },
+      "stopAtEntry": false,
+      "windows": {
+        "type": "cppvsdbg",
+        "console": "internalConsole"
+      },
+      "osx": {
+        "postRunCommands": [
+          "process handle SIGUSR1 -s false -n false -p true",
+          "process handle SIGUSR2 -s false -n false -p true"
+        ],
+      },
+      "linux": {
+        "postRunCommands": [
+          "process handle SIGUSR1 -s false -n false -p true",
+          "process handle SIGUSR2 -s false -n false -p true"
+        ],
+      }
+    },
+    {
+      "name": "Launch cmake binary",
+      "type": "lldb",
+      "request": "launch",
+      "console": "integratedTerminal",
+      "program": "${command:cmake.launchTargetPath}",
+      "args": [
+        // "--gtest_repeat=-1",
+        //"--gtest_filter=JwkTokenAuthTest.message",
+      ],
+      "env": {
+        "ASAN_OPTIONS": "detect_leaks=0:detect_container_overflow=0:detect_odr_violation=0:symbolize=1",
+      },
+      "cwd": "${workspaceFolder}/build",
+    },
+    {
+      // You need root access to attach debugger
+      "name": "Attach process (requires root)",
+      "type": "lldb",
+      "symbolSearchPath": "${workspaceFolder}/objs/build/debug_info;${env:VK_SDK_PATH}/bin",
+      "request": "attach",
+      "pid": "${command:pickProcess}",
+      "windows": {
+        "type": "cppvsdbg",
+      },
+      "osx": {
+        "postRunCommands": [
+          "process handle SIGUSR1 -s false -n false -p true",
+          "process handle SIGUSR2 -s false -n false -p true",
+        ]
+      },
+      "linux": {
+        "postRunCommands": [
+          "process handle SIGUSR1 -s false -n false -p true",
+          "process handle SIGUSR2 -s false -n false -p true",
+        ]
+      }
+    },
+  ]
+}

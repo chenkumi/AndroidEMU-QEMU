@@ -1,0 +1,102 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ui version="4.0">
+ <class>TouchpadHolder</class>
+ <widget class="QWidget" name="TouchpadHolder">
+  <layout class="QGridLayout" name="gridLayout">
+   <property name="alignment">
+    <set>Qt::AlignHCenter</set>
+   </property>
+   <item row="0" column="0">
+    <widget class="TouchpadWidget" name="touchpadBox">
+     <property name="sizePolicy">
+      <sizepolicy hsizetype="Expanding" vsizetype="Expanding">
+       <horstretch>1</horstretch>
+       <verstretch>1</verstretch>
+      </sizepolicy>
+     </property>
+    </widget>
+   </item>
+   <item row="0" column="0">
+    <widget class="QGroupBox" name="tp_twoFingerLabel">
+     <property name="styleSheet">
+      <string notr="true">border: 0px;</string>
+     </property>
+     <property name="title">
+      <string>Hold shift for two fingers</string>
+     </property>
+     <property name="ColorGroup" stdset="0">
+      <string notr="true">Title</string>
+     </property>
+    </widget>
+   </item>
+   <item row="0" column="1" alignment="Qt::AlignTop">
+    <layout class="QVBoxLayout" name="ledLayout">
+     <property name="spacing">
+      <number>6</number>
+     </property>
+     <item alignment="Qt::AlignHCenter">
+      <widget class="LedIndicatorWidget" name="worldLedIndicator">
+       <property name="toolTip">
+        <string>World facing LED</string>
+       </property>
+       <property name="minimumSize">
+        <size>
+         <width>12</width>
+         <height>12</height>
+        </size>
+       </property>
+       <property name="maximumSize">
+        <size>
+         <width>12</width>
+         <height>12</height>
+        </size>
+       </property>
+      </widget>
+     </item>
+     <item alignment="Qt::AlignHCenter">
+      <widget class="LedIndicatorWidget" name="userLedIndicator">
+       <property name="toolTip">
+        <string>User facing LED</string>
+       </property>
+       <property name="minimumSize">
+        <size>
+         <width>12</width>
+         <height>12</height>
+        </size>
+       </property>
+       <property name="maximumSize">
+        <size>
+         <width>12</width>
+         <height>12</height>
+        </size>
+       </property>
+      </widget>
+     </item>
+    </layout>
+   </item>
+  </layout>
+ </widget>
+ <customwidgets>
+  <customwidget>
+   <class>LedIndicatorWidget</class>
+   <extends>QWidget</extends>
+   <header>android/skin/qt/ledindicator-widget.h</header>
+   <container>0</container>
+  </customwidget>
+  <customwidget>
+   <class>RaisedMaterialButton</class>
+   <extends>QPushButton</extends>
+   <header>android/skin/qt/raised-material-button.h</header>
+  </customwidget>
+  <customwidget>
+   <class>TouchpadWidget</class>
+   <extends>QWidget</extends>
+   <header>android/skin/qt/touchpad-widget.h</header>
+   <container>1</container>
+  </customwidget>
+ </customwidgets>
+ <resources>
+  <include location="../resources.qrc"/>
+ </resources>
+ <connections/>
+</ui>

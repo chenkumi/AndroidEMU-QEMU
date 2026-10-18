@@ -1,0 +1,23 @@
+// Copyright 2022 The Android Open Source Project
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package netsim.common;
+
+option java_multiple_files = true;
+option java_package = "com.android.emulation.bluetooth";
+
+// Radio Type (BT, WIFI, UWB, NFC, CELLULAR, CELLULAR_DATA, ETHERNET)
+enum ChipKind {
+  // Default to UNSPECIFIED
+  UNSPECIFIED = 0;
+  BLUETOOTH = 1;
+  WIFI = 2;
+  UWB = 3;
+  BLUETOOTH_BEACON = 4 [deprecated = true];
+  NFC = 5;
+  CELLULAR = 6;
+  CELLULAR_DATA = 7;
+  ETHERNET = 8;
+}

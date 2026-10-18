@@ -1,0 +1,285 @@
+// Copyright (C) 2025 The Android Open Source Project
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+#include <map>
+#include <vector>
+
+#include "aemu/base/logging/LogSeverity.h"
+#include "fishtank_agents.h"
+
+#include "android/emulation/control/user_event_agent.h"
+#include "android/emulation/control/utils/EmulatorControlClient.h"
+#include "android/grpc/utils/SimpleAsyncGrpc.h"
+#include "android/multitouch-screen.h"
+#include "android/skin/event.h"
+#include "android/skin/generic-event-buffer.h"
+#include "android/utils/debug.h"
+#include "emulator_controller.pb.h"
+
+using ::SimpleClientWriter;
+using android::emulation::control::EmulatorControlClient;
+using android::emulation::control::InputEvent;
+using android::emulation::control::KeyboardEvent;
+using android::emulation::control::MouseEvent;
+using android::emulation::control::Touch;
+using android::emulation::control::TouchEvent;
+using android::emulation::control::TouchpadEvent;
+using android::emulation::control::WheelEvent;
+
+static EmulatorControlClient* sClient = nullptr;
+static std::map<int, std::vector<Touch>> sTouchBuffer;
+static std::map<int, std::vector<Touch>> sTouchpadBuffer;
+
+void initializeGrpcUserEventAgent(EmulatorControlClient* client) {
+    sClient = client;
+}
+
+static SimpleClientWriter<InputEvent>* getWriter() {
+    if (!sClient) {
+        return nullptr;
+    }
+    return sClient->asyncInputEventWriter();
+}
+
+static void grpc_sendKey(unsigned keycode, bool is_down) {
+    auto writer = getWriter();
+    if (!writer)
+        return;
+
+    auto keyEvent = std::make_unique<KeyboardEvent>();
+    keyEvent->set_codetype(KeyboardEvent::Evdev);
+    keyEvent->set_eventtype(is_down ? KeyboardEvent::keydown
+                                    : KeyboardEvent::keyup);
+    keyEvent->set_keycode(keycode);
+
+    auto inputEvent = std::make_unique<InputEvent>();
+    inputEvent->set_allocated_key_event(keyEvent.release());
+    writer->Write(*inputEvent);
+}
+
+static void grpc_sendKeyCodeWithWriter(SimpleClientWriter<InputEvent>* writer,
+                                       int keycode) {
+    if (!writer)
+        return;
+
+    auto keyEvent = std::make_unique<KeyboardEvent>();
+    keyEvent->set_codetype(KeyboardEvent::Evdev);
+
+    // EvDev keydow/up mask.
+    bool down = keycode & 0x400;
+    keyEvent->set_eventtype(down ? KeyboardEvent::keydown
+                                 : KeyboardEvent::keyup);
+    keyEvent->set_keycode(keycode);
+    if (VERBOSE_CHECK(keys))
+        LOG(INFO) << "Keyboard: " << keyEvent->ShortDebugString();
+
+    auto inputEvent = std::make_unique<InputEvent>();
+    inputEvent->set_allocated_key_event(keyEvent.release());
+    writer->Write(*inputEvent);
+}
+
+static void grpc_sendKeyCode(int keycode) {
+    grpc_sendKeyCodeWithWriter(getWriter(), keycode);
+}
+
+static void grpc_sendKeyCodes(int* keycodes, int count) {
+    auto writer = getWriter();
+    if (!writer)
+        return;
+
+    for (int i = 0; i < count; ++i) {
+        grpc_sendKeyCodeWithWriter(writer, keycodes[i]);
+    }
+}
+
+static void setupTouch(Touch* touch, const SkinEvent* const ev) {
+    touch->set_x(ev->u.multi_touch_point.x);
+    touch->set_y(ev->u.multi_touch_point.y);
+    touch->set_identifier(ev->u.multi_touch_point.id);
+    touch->set_pressure(ev->u.multi_touch_point.pressure);
+    touch->set_touch_major(ev->u.multi_touch_point.touch_major);
+    touch->set_touch_minor(ev->u.multi_touch_point.touch_minor);
+    touch->set_orientation(ev->u.multi_touch_point.orientation);
+}
+
+static void flushBufferedTouches(SimpleClientWriter<InputEvent>* writer,
+                                 std::map<int, std::vector<Touch>>& buffer,
+                                 int id,
+                                 bool isTouchpad) {
+    auto& touches = buffer[id];
+    if (touches.empty()) {
+        return;
+    }
+
+    InputEvent inputEvent;
+    if (isTouchpad) {
+        TouchpadEvent* touchpadEvent = inputEvent.mutable_touchpad_event();
+        for (const auto& touch : touches) {
+            touchpadEvent->add_touches()->CopyFrom(touch);
+        }
+        touchpadEvent->set_touchpad(id);
+        if (VERBOSE_CHECK(keys))
+            LOG(INFO) << "Touchpad: " << touchpadEvent->ShortDebugString();
+    } else {
+        TouchEvent* touchEvent = inputEvent.mutable_touch_event();
+        for (const auto& touch : touches) {
+            touchEvent->add_touches()->CopyFrom(touch);
+        }
+        touchEvent->set_display(id);
+        if (VERBOSE_CHECK(keys))
+            LOG(INFO) << "Touch: " << touchEvent->ShortDebugString();
+    }
+    writer->Write(inputEvent);
+    touches.clear();
+}
+
+static void grpc_sendTouchEvents(const SkinEvent* const event, int displayId) {
+    auto writer = getWriter();
+    if (!writer)
+        return;
+
+    Touch touch;
+    setupTouch(&touch, event);
+    sTouchBuffer[displayId].push_back(std::move(touch));
+
+    if (!event->u.multi_touch_point.skip_sync) {
+        flushBufferedTouches(writer, sTouchBuffer, displayId, false);
+    }
+}
+
+static void grpc_sendTouchpadEvents(const SkinEvent* const event,
+                                    int touchpadId) {
+    auto writer = getWriter();
+    if (!writer)
+        return;
+
+    Touch touch;
+    setupTouch(&touch, event);
+    sTouchpadBuffer[touchpadId].push_back(std::move(touch));
+
+    if (!event->u.multi_touch_point.skip_sync) {
+        flushBufferedTouches(writer, sTouchpadBuffer, touchpadId, true);
+    }
+}
+
+static void grpc_sendMouseEvent(int dx,
+                                int dy,
+                                int dz,
+                                int buttons_state,
+                                int display_id,
+                                MouseEventMode mode) {
+    auto writer = getWriter();
+    if (!writer)
+        return;
+
+    // Check if this is a simulated multi-touch event (pinch-zoom)
+    // using kShiftShouldSkipSync (0x2) or kShiftSecondaryTouch (0x4).
+    if (buttons_state & (kShiftShouldSkipSync | kShiftSecondaryTouch)) {
+        Touch touch;
+        touch.set_x(dx);
+        touch.set_y(dy);
+        touch.set_identifier(multitouch_is_second_finger(buttons_state) ? 1 : 0);
+        touch.set_pressure(multitouch_is_touch_down(buttons_state)
+                                   ? MTS_PRESSURE_RANGE_MAX
+                                   : 0);
+        sTouchBuffer[display_id].push_back(std::move(touch));
+
+        if (!multitouch_should_skip_sync(buttons_state)) {
+            flushBufferedTouches(writer, sTouchBuffer, display_id, false);
+        }
+        return;
+    }
+
+    InputEvent inputEvent;
+    MouseEvent* mouseEvent = inputEvent.mutable_mouse_event();
+    mouseEvent->set_x(dx);
+    mouseEvent->set_y(dy);
+    mouseEvent->set_buttons(buttons_state);
+    mouseEvent->set_display(display_id);
+    if (VERBOSE_CHECK(keys))
+        LOG(INFO) << "Mouse: " << mouseEvent->ShortDebugString();
+
+    writer->Write(inputEvent);
+}
+
+static void grpc_sendMouseWheelEvent(int dx, int dy, int displayId) {
+    auto writer = getWriter();
+    if (!writer)
+        return;
+
+    auto wheelEvent = std::make_unique<WheelEvent>();
+    wheelEvent->set_dx(dx);
+    wheelEvent->set_dy(dy);
+    wheelEvent->set_display(displayId);
+    if (VERBOSE_CHECK(keys))
+        LOG(INFO) << "Wheel: " << wheelEvent->ShortDebugString();
+
+    auto inputEvent = std::make_unique<InputEvent>();
+    inputEvent->set_allocated_wheel_event(wheelEvent.release());
+
+    writer->Write(*inputEvent);
+}
+
+static void grpc_sendRotaryEvent(int rotation) {
+    // Simulate rotary event as a vertical mouse wheel event.
+    grpc_sendMouseWheelEvent(0, rotation, 0);
+}
+
+static void grpc_sendGenericEvent(SkinGenericEventCode code) {
+    auto writer = getWriter();
+    if (!writer)
+        return;
+
+    auto keyEvent = std::make_unique<KeyboardEvent>();
+    keyEvent->set_eventtype(KeyboardEvent::keypress);
+
+    if (VERBOSE_CHECK(keys))
+        LOG(INFO) << "Send generic event code: "
+                  << keyEvent->ShortDebugString();
+    auto inputEvent = std::make_unique<InputEvent>();
+    inputEvent->set_allocated_key_event(keyEvent.release());
+    writer->Write(*inputEvent);
+}
+
+const QAndroidUserEventAgent sFishtankQAndroidUserEventAgent = {
+        .sendKey = grpc_sendKey,
+        .sendKeyCode = grpc_sendKeyCode,
+        .sendKeyCodes = grpc_sendKeyCodes,
+        .sendTouchEvents = grpc_sendTouchEvents,
+        .sendTouchpadEvents = grpc_sendTouchpadEvents,
+        .sendMouseEvent = grpc_sendMouseEvent,
+        .sendPenEvent =
+                [](int displayId,
+                   int type,
+                   const SkinEvent* events,
+                   int count,
+                   int buttons_state) {
+                    NOT_IMPLEMENTED("QAndroidUserEventAgent.sendPenEvent");
+                },
+        .sendMouseWheelEvent = grpc_sendMouseWheelEvent,
+        .sendRotaryEvent = grpc_sendRotaryEvent,
+        .sendGenericEvent = grpc_sendGenericEvent,
+        .sendGenericEvents =
+                [](SkinGenericEventCode* codes, int count) {
+                    for (int i = 0; i < count; ++i) {
+                        grpc_sendGenericEvent(codes[i]);
+                    }
+                },
+        .onNewUserEvent = []() { /* No-op for gRPC */ },
+        .eventsDropped =
+                []() {
+                    // We don't have a good way to check this with the async
+                    // writer.
+                    return 0;
+                },
+};
