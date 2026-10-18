@@ -95,71 +95,37 @@ dump_mmerror( const char*  func, MMRESULT  error )
 /** AUDIO OUT
  **/
 
-typedef struct WinAudioOutDevice {
-    HWAVEOUT          waveout;
-    unsigned char*    buffer_bytes;
-    WAVEHDR           buffers[ NUM_OUT_BUFFERS ];
-    bool              retired;
-} WinAudioOutDevice;
-
 typedef struct WinAudioOut {
     HWVoiceOut        hw;
-    WinAudioOutDevice* device;
+    HWAVEOUT          waveout;
     int               silence;
+    CRITICAL_SECTION  lock;
+    bool              lock_initialized;
     int               write_errors;
+    unsigned char*    buffer_bytes;
+    WAVEHDR           buffers[ NUM_OUT_BUFFERS ];
     int               write_index;   /* starting first writable buffer      */
+    int               write_count;   /* available writable buffers count    */
     int               write_pos;     /* position in current writable buffer */
     int               write_size;    /* size in bytes of each buffer        */
 } WinAudioOut;
 
-/* Output device ownership is serialized by the audio core, not a callback.
- * One slot bounds retained resources even if a driver permanently rejects close.
- * Its headers/PCM must survive audio_template.h freeing the HWVoiceOut. */
-static WinAudioOutDevice* winaudio_out_device;
-
-static bool
-winaudio_out_can_write (WinAudioOut *s)
+/* The Win32 callback that is called when a buffer has finished playing */
+static void CALLBACK
+winaudio_out_buffer_done (HWAVEOUT hwo, UINT uMsg, DWORD_PTR dwInstance,
+			              DWORD_PTR dwParam1, DWORD_PTR dwParam2)
 {
-    if (!s->device) {
-        return false;
-    }
-    /* WinMM owns dwFlags while queued. Poll on the existing audio timer; never
-     * overwrite the current header even if another header completed first. */
-    return !(*(volatile DWORD *)&s->device->buffers[s->write_index].dwFlags &
-             WHDR_INQUEUE);
-}
+    WinAudioOut*  s = (WinAudioOut*) dwInstance;
 
-static bool
-winaudio_out_release_device (WinAudioOutDevice *device)
-{
-    int i;
-    MMRESULT result;
-    if (device->waveout) {
-        result = waveOutReset(device->waveout);
-        if (result != MMSYSERR_NOERROR) {
-            dump_mmerror("waveOutReset()", result);
-            return false;
-        }
-        for (i = 0; i < NUM_OUT_BUFFERS; ++i) {
-            if (device->buffers[i].dwFlags & WHDR_PREPARED) {
-                result = waveOutUnprepareHeader(device->waveout,
-                    &device->buffers[i], sizeof(device->buffers[i]));
-                if (result != MMSYSERR_NOERROR) {
-                    dump_mmerror("waveOutUnprepareHeader()", result);
-                    return false;
-                }
-            }
-        }
-        result = waveOutClose(device->waveout);
-        if (result != MMSYSERR_NOERROR) {
-            dump_mmerror("waveOutClose()", result);
-            return false;
-        }
-        device->waveout = NULL;
-    }
-    g_free(device->buffer_bytes);
-    g_free(device);
-    return true;
+    /* Only service "buffer done playing" messages */
+    if ( uMsg != WOM_DONE )
+            return;
+
+    /* Signal that we are done playing a buffer */
+    EnterCriticalSection( &s->lock );
+    if (s->write_count < NUM_OUT_BUFFERS)
+        s->write_count += 1;
+    LeaveCriticalSection( &s->lock );
 }
 
 static int
@@ -172,14 +138,23 @@ static void
 winaudio_out_fini (HWVoiceOut *hw)
 {
     WinAudioOut *s = (WinAudioOut *)hw;
-    WinAudioOutDevice *device = s->device;
-    s->device = NULL;
-    if (!device) {
-        return;
+    int i;
+    if (s->waveout) {
+        waveOutReset(s->waveout);
+        for (i = 0; i < NUM_OUT_BUFFERS; ++i) {
+            if (s->buffers[i].dwFlags & WHDR_PREPARED) {
+                waveOutUnprepareHeader(s->waveout, &s->buffers[i],
+                                       sizeof(s->buffers[i]));
+            }
+        }
+        waveOutClose(s->waveout);
+        s->waveout = NULL;
     }
-    device->retired = true;
-    if (winaudio_out_release_device(device)) {
-        winaudio_out_device = NULL;
+    g_free(s->buffer_bytes);
+    s->buffer_bytes = NULL;
+    if (s->lock_initialized) {
+        DeleteCriticalSection(&s->lock);
+        s->lock_initialized = false;
     }
 }
 
@@ -191,51 +166,49 @@ winaudio_out_init (HWVoiceOut *hw, struct audsettings *as, void* drv_opaque)
     MMRESULT       result;
     WAVEFORMATEX   format;
     int            i, samples_size;
-    WinAudioOutDevice *device;
 
-    s->device = NULL;
-    if (winaudio_out_device) {
-        if (!winaudio_out_device->retired ||
-            !winaudio_out_release_device(winaudio_out_device)) {
-            AUD_log(AUDIO_CAP, "waveOut device is still owned; refusing another allocation\n");
-            return -1;
-        }
-        winaudio_out_device = NULL;
+    s->waveout = NULL;
+    InitializeCriticalSection( &s->lock );
+    s->lock_initialized = true;
+    for (i = 0; i < NUM_OUT_BUFFERS; i++) {
+            s->buffers[i].dwUser = 0xFFFF;
     }
+    s->buffer_bytes = NULL;
 
     if (conf.nb_samples <= 0 || conf.nb_samples > 65536 ||
         (as->fmt != AUD_FMT_U8 && as->fmt != AUD_FMT_S16 &&
          as->fmt != AUD_FMT_S32) ||
         waveformat_from_audio_settings(&format, as)) {
-        return -1;
+        goto fail;
     }
     s->silence = as->fmt == AUD_FMT_U8 ? 0x80 : 0;
-    device = g_malloc0(sizeof(*device));
-    if (!device) {
-        return -1;
-    }
-    winaudio_out_device = s->device = device;
 
-    /* The audio core already polls run_out. No callback may retain the voice. */
-    result = waveOutOpen(&device->waveout, WAVE_MAPPER, &format, 0, 0, CALLBACK_NULL);
+    /* open the wave out device */
+    result = waveOutOpen( &s->waveout, WAVE_MAPPER, &format,
+                                  (DWORD_PTR)winaudio_out_buffer_done, (DWORD_PTR) hw,
+                                              CALLBACK_FUNCTION);
     if ( result != MMSYSERR_NOERROR ) {
         dump_mmerror( "qemu: winaudio: waveOutOpen()", result);
             goto fail;
     }
 
     samples_size    = format.nBlockAlign * conf.nb_samples;
-    device->buffer_bytes = g_malloc( NUM_OUT_BUFFERS * samples_size );
-    if (device->buffer_bytes == NULL) {
+    s->buffer_bytes = g_malloc( NUM_OUT_BUFFERS * samples_size );
+    if (s->buffer_bytes == NULL) {
+            waveOutClose( s->waveout );
+            s->waveout = NULL;
             fprintf(stderr, "not enough memory for Windows audio buffers\n");
             goto fail;
     }
 
     for (i = 0; i < NUM_OUT_BUFFERS; i++) {
-        device->buffers[i].lpData = (LPSTR)(device->buffer_bytes + i*samples_size);
-        device->buffers[i].dwBufferLength = samples_size;
+        memset( &s->buffers[i], 0, sizeof(s->buffers[i]) );
+        s->buffers[i].lpData         = (LPSTR)(s->buffer_bytes + i*samples_size);
+        s->buffers[i].dwBufferLength = samples_size;
+        s->buffers[i].dwFlags        = WHDR_DONE;
 
-        result = waveOutPrepareHeader(device->waveout, &device->buffers[i],
-                                      sizeof(device->buffers[i]));
+        result = waveOutPrepareHeader( s->waveout, &s->buffers[i],
+                               sizeof(s->buffers[i]) );
         if ( result != MMSYSERR_NOERROR ) {
             dump_mmerror("waveOutPrepareHeader()", result);
             goto fail;
@@ -247,7 +220,7 @@ winaudio_out_init (HWVoiceOut *hw, struct audsettings *as, void* drv_opaque)
     {
         WAVEOUTCAPS caps;
 
-        result = waveOutGetDevCaps((UINT_PTR) device->waveout, &caps, sizeof(caps));
+        result = waveOutGetDevCaps((UINT) s->waveout, &caps, sizeof(caps));
         if ( result != MMSYSERR_NOERROR ) {
             dump_mmerror("waveOutGetDevCaps()", result);
         } else
@@ -259,6 +232,7 @@ winaudio_out_init (HWVoiceOut *hw, struct audsettings *as, void* drv_opaque)
     hw->samples = conf.nb_samples*2;
 
     s->write_index = 0;
+    s->write_count = NUM_OUT_BUFFERS;
     s->write_pos   = 0;
     s->write_size  = samples_size;
     AUD_log(AUDIO_CAP, "waveOut initialized rate=%lu channels=%u bits=%u buffers=%d frames=%d\n",
@@ -277,18 +251,19 @@ winaudio_out_run (HWVoiceOut *hw, int live)
 {
     WinAudioOut*  s      = (WinAudioOut*) hw;
     int           played = 0;
-    int           buffer_new_samples = 0;
     int           has_buffer;
 
     if (!live) {
         return 0;
     }
 
-    has_buffer = winaudio_out_can_write(s);
+    EnterCriticalSection( &s->lock );
+    has_buffer = (s->write_count > 0);
+    LeaveCriticalSection( &s->lock );
 
     if (has_buffer) {
         while (live > 0) {
-            WAVEHDR*      wav_buffer  = s->device->buffers + s->write_index;
+            WAVEHDR*      wav_buffer  = s->buffers + s->write_index;
             int           wav_bytes   = (s->write_size - s->write_pos);
             int           wav_samples = audio_MIN(wav_bytes >> hw->info.shift, live);
             int           hw_samples  = audio_MIN(hw->samples - hw->rpos, live);
@@ -310,35 +285,33 @@ winaudio_out_run (HWVoiceOut *hw, int live)
 
             live         -= wav_samples;
             played       += wav_samples;
-            buffer_new_samples += wav_samples;
             s->write_pos += wav_bytes;
             if (s->write_pos == s->write_size) {
                 MMRESULT result;
-                result = waveOutWrite(s->device->waveout, wav_buffer, sizeof(*wav_buffer));
+                /* Reserve before submission: WOM_DONE may arrive immediately. */
+                EnterCriticalSection(&s->lock);
+                --s->write_count;
+                LeaveCriticalSection(&s->lock);
+                result = waveOutWrite(s->waveout, wav_buffer, sizeof(*wav_buffer));
                 if (result != MMSYSERR_NOERROR) {
-                    if (s->write_errors < 4) {
-                        ++s->write_errors;
+                    EnterCriticalSection(&s->lock);
+                    ++s->write_count;
+                    LeaveCriticalSection(&s->lock);
+                    if (s->write_errors++ < 4) {
                         dump_mmerror("waveOutWrite()", result);
                     }
-                    /* Keep rejected PCM live in the core for the next tick.
-                     * Earlier calls' partial prefix and accepted blocks stay. */
-                    s->write_pos -= buffer_new_samples << hw->info.shift;
-                    hw->rpos -= buffer_new_samples;
-                    if (hw->rpos < 0) {
-                        hw->rpos += hw->samples;
-                    }
-                    played -= buffer_new_samples;
                     return played;
                 }
-                buffer_new_samples = 0;
                 s->write_pos    = 0;
                 s->write_index += 1;
                 if (s->write_index == NUM_OUT_BUFFERS)
                     s->write_index = 0;
 
-                if (!winaudio_out_can_write(s)) {
+                EnterCriticalSection( &s->lock );
+                if (s->write_count == 0) {
                         live = 0;
                 }
+                LeaveCriticalSection( &s->lock );
             }
         }
 
@@ -350,17 +323,14 @@ static int
 winaudio_out_ctl (HWVoiceOut *hw, int cmd, ...)
 {
     WinAudioOut*  s = (WinAudioOut*) hw;
-    if (!s->device) {
-        return 0;
-    }
 
     switch (cmd) {
     case VOICE_ENABLE:
-        waveOutRestart(s->device->waveout);
+        waveOutRestart( s->waveout );
         break;
 
     case VOICE_DISABLE:
-        waveOutPause(s->device->waveout);
+        waveOutPause( s->waveout );
         break;
     }
     return 0;
@@ -660,13 +630,6 @@ winaudio_init(void)
 static void
 winaudio_fini (void *opaque)
 {
-    if (winaudio_out_device && winaudio_out_device->retired) {
-        if (winaudio_out_release_device(winaudio_out_device)) {
-            winaudio_out_device = NULL;
-        } else {
-            AUD_log(AUDIO_CAP, "waveOut driver retains one device until recovery or process exit\n");
-        }
-    }
 }
 
 static struct audio_option winaudio_options[] = {

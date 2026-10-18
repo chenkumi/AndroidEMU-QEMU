@@ -1541,18 +1541,6 @@ static bool virtio_snd_stream_gpcm_to_hpcm_locked(VirtIOSoundPCMStream *stream) 
     return true;
 }
 
-static bool virtio_snd_stream_output_tick_locked(VirtIOSoundPCMStream *stream) {
-    const bool copied = virtio_snd_stream_gpcm_to_hpcm_locked(stream);
-    if (copied) {
-        stream->next_vq_irq_us += stream->period_us;
-        virtio_notify(&stream->snd->parent, stream->snd->tx_vq);
-    } else {
-        stream->next_vq_irq_us += (stream->period_us / 4);
-    }
-    timer_mod(&stream->vq_irq_timer, stream->next_vq_irq_us);
-    return copied;
-}
-
 static void stream_out_cb_locked(VirtIOSoundPCMStream *stream, int avail) {
     ASSERT(avail > 0);
     SWVoiceOut *const voice = stream->voice.out;
@@ -1580,21 +1568,6 @@ static void stream_out_cb_locked(VirtIOSoundPCMStream *stream, int avail) {
             }
         } else {
             ASSERT(stream->hpcm_buf.size == 0);
-            // The host callback can precede the next guest-period timer. Let
-            // that timer pace queued PCM and descriptor completion instead of
-            // inserting extra samples or completing guest periods prematurely.
-            if (min_write_sz > 0 &&
-                stream->state == VIRTIO_PCM_STREAM_STATE_RUNNING &&
-                vq_ring_buffer_top(&stream->gpcm_buf)) {
-                /* Audio callbacks and the period timer can become runnable
-                 * together. Process only a period already due; never advance
-                 * guest progress ahead of its existing deadline. */
-                if (qemu_clock_get_us(QEMU_CLOCK_VIRTUAL_RT) >= stream->next_vq_irq_us &&
-                    virtio_snd_stream_output_tick_locked(stream)) {
-                    continue;
-                }
-                return;
-            }
             if (min_write_sz > 0) {
                 int16_t scratch[AUD_SCRATCH_SIZE];
                 DPRINTF("inserting %d frames of silence, state=%s",
@@ -1624,7 +1597,14 @@ static void virtio_snd_stream_output_irq(void *opaque) {
 
     qemu_mutex_lock(&stream->mtx);
     if (stream->state == VIRTIO_PCM_STREAM_STATE_RUNNING) {
-        virtio_snd_stream_output_tick_locked(stream);
+        if (virtio_snd_stream_gpcm_to_hpcm_locked(stream)) {
+            stream->next_vq_irq_us += stream->period_us;
+            virtio_notify(&stream->snd->parent, stream->snd->tx_vq);
+        } else {
+            stream->next_vq_irq_us += (stream->period_us / 4);
+        }
+
+        timer_mod(&stream->vq_irq_timer, stream->next_vq_irq_us);
     }
     qemu_mutex_unlock(&stream->mtx);
 }

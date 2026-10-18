@@ -250,8 +250,7 @@ static void GCC_FMT_ATTR (3, 4) dsound_logerr2 (
 
 static DWORD millis_to_bytes (struct audio_pcm_info *info, DWORD millis)
 {
-    uint64_t bytes = (uint64_t)millis * info->bytes_per_second / 1000;
-    return bytes > UINT32_MAX ? UINT32_MAX : (DWORD)bytes;
+    return (millis * info->bytes_per_second) / 1000;
 }
 
 /* Never prefill inside the host-owned play-to-write cursor region. */
@@ -507,7 +506,7 @@ static int dsound_run_out (HWVoiceOut *hw, int live)
     hr = IDirectSoundBuffer_GetCurrentPosition (
         dsb,
         &ppos,
-        &wpos
+        ds->first_time ? &wpos : NULL
         );
     if (FAILED (hr)) {
         dsound_logerr (hr, "Could not get playback buffer position\n");
@@ -519,24 +518,24 @@ static int dsound_run_out (HWVoiceOut *hw, int live)
     if (ds->first_time) {
         old_pos = dsound_start_offset(&hw->info, conf->latency_millis,
                                        wpos, ppos, bufsize);
+        ds->first_time = 0;
 #ifdef DEBUG_DSOUND
         ds->played = 0;
         ds->mixed = 0;
 #endif
     }
     else {
+        if (ds->old_pos == ppos) {
+#ifdef DEBUG_DSOUND
+            dolog ("old_pos == ppos\n");
+#endif
+            return 0;
+        }
+
 #ifdef DEBUG_DSOUND
         ds->played += audio_ring_dist (ds->old_pos, ppos, hw->bufsize);
 #endif
         old_pos = ds->old_pos;
-        /* A delayed audio tick can leave our cursor inside the region already
-         * owned by the host. Never overwrite it, even after initial prefill.
-         * Rebase the destination only; keep every unconsumed guest sample. */
-        if (audio_ring_dist(old_pos, ppos, bufsize) <
-            audio_ring_dist(wpos, ppos, bufsize)) {
-            old_pos = dsound_start_offset(&hw->info, conf->latency_millis,
-                                         wpos, ppos, bufsize);
-        }
     }
 
     if ((old_pos < ppos) && ((old_pos + len) > ppos)) {
@@ -579,7 +578,6 @@ static int dsound_run_out (HWVoiceOut *hw, int live)
     len1 = blen1 >> hwshift;
     len2 = blen2 >> hwshift;
     decr = len1 + len2;
-    const int rpos_before = hw->rpos;
 
     if (p1 && len1) {
         dsound_write_sample (hw, p1, len1);
@@ -589,13 +587,7 @@ static int dsound_run_out (HWVoiceOut *hw, int live)
         dsound_write_sample (hw, p2, len2);
     }
 
-    if (dsound_unlock_out (dsb, p1, p2, blen1, blen2)) {
-        /* Clipping only reads mix_buf, but advances rpos. Do not acknowledge
-         * guest PCM or commit the destination cursor after a failed Unlock. */
-        hw->rpos = rpos_before;
-        return 0;
-    }
-    ds->first_time = 0;
+    dsound_unlock_out (dsb, p1, p2, blen1, blen2);
     ds->old_pos = (old_pos + (decr << hwshift)) % bufsize;
 
 #ifdef DEBUG_DSOUND
