@@ -11,6 +11,7 @@
  */
 
 #include "android/skin/qt/emulator-qt-window.h"
+#include "android/skin/qt/startup-window-gate.h"
 
 #include "aemu/base/Optional.h"
 #include "aemu/base/async/ThreadLooper.h"
@@ -676,6 +677,7 @@ EmulatorQtWindow::EmulatorQtWindow(QWidget* parent)
 
     mToolWindow = new ToolWindow(this, &mContainer, mEventLogger,
                                  mUserActionsCounter);
+    mContainer.attachToolWindow(mToolWindow);
 
     if (avdInfo_getAvdFlavor(getConsoleAgents()->settings->avdInfo()) ==
         AVD_ANDROID_AUTO) {
@@ -936,6 +938,7 @@ EmulatorQtWindow::~EmulatorQtWindow() {
 
     deleteErrorDialog();
     if (mToolWindow) {
+        mContainer.detachToolWindow();
         delete mToolWindow;
         mToolWindow = NULL;
     }
@@ -1123,6 +1126,12 @@ void EmulatorQtWindow::closeEvent(QCloseEvent* event) {
 
     if (mMainLoopThread && mMainLoopThread->isRunning()) {
         if (!alreadyClosed) {
+            // The window stays up until the engine is gone; say so instead of showing a frozen frame.
+            if (auto bootTimer = findChild<QTimer*>("androidemu_boot_overlay_timer")) {
+                bootTimer->stop();
+                bootTimer->deleteLater();
+            }
+            mContainer.showModalOverlay(QStringLiteral(u"\u6B63\u5728\u95DC\u9589 Android\uFF0C\u8ACB\u7A0D\u5019\u2026"));
             // we dont want to restore to a state where the
             // framework is shut down by 'adb reboot -p'
             // so skip that step when saving vm on exit
@@ -1597,6 +1606,10 @@ void EmulatorQtWindow::maskWindowFrame() {
 
     flags &= ~FRAME_WINDOW_FLAGS_MASK;
     flags |= (haveFrame ? FRAMED_WINDOW_FLAGS : FRAMELESS_WINDOW_FLAGS);
+    if (mContainer.integratedUi()) {
+        flags |= Qt::WindowMinimizeButtonHint | Qt::WindowMaximizeButtonHint |
+                 Qt::WindowCloseButtonHint;
+    }
 
     mContainer.setWindowFlags(flags);
 
@@ -1893,7 +1906,7 @@ void EmulatorQtWindow::show() {
 
 void EmulatorQtWindow::setOnTop(bool onTop) {
     setFrameOnTop(&mContainer, onTop);
-    setFrameOnTop(mToolWindow, onTop);
+    if (mToolWindow->isWindow()) setFrameOnTop(mToolWindow, onTop);
     if (mCarClusterWindow) {
         setFrameOnTop(mCarClusterWindow, onTop);
     }
@@ -2128,6 +2141,7 @@ void EmulatorQtWindow::startThread(StartFunction f, int argc, char** argv) {
 void EmulatorQtWindow::slot_clearInstance() {
 #ifndef __APPLE__
     if (mToolWindow) {
+        mContainer.detachToolWindow();
         delete mToolWindow;
         mToolWindow = NULL;
     }
@@ -2259,6 +2273,12 @@ void EmulatorQtWindow::slot_getFramePos(int* xx,
 void EmulatorQtWindow::slot_isWindowFullyVisible(bool* out_value,
                                                  QSemaphore* semaphore) {
     QSemaphoreReleaser semReleaser(semaphore);
+    if (auto gate = StartupWindowGate::get(&mContainer)) {
+        if (!gate->released()) {
+            *out_value = gate->plannedGeometryVisible();
+            return;
+        }
+    }
     auto newScreen = mContainer.window()->windowHandle()
                              ? mContainer.window()->windowHandle()->screen()
                              : nullptr;
@@ -2430,11 +2450,12 @@ void EmulatorQtWindow::slot_setDeviceGeometry(QRect rect,
 void EmulatorQtWindow::slot_setWindowPos(int x, int y, QSemaphore* semaphore) {
     QSemaphoreReleaser semReleaser(semaphore);
     mContainer.move(x, y);
+    if (auto gate = StartupWindowGate::get(&mContainer)) gate->positioned();
 }
 
 void EmulatorQtWindow::slot_setWindowSize(int w, int h, QSemaphore* semaphore) {
     QSemaphoreReleaser semReleaser(semaphore);
-    mContainer.resize(w, h);
+    mContainer.resizeForDisplay(QSize(w, h));
 }
 
 void EmulatorQtWindow::slot_paintWindowOverlayForResize(int mouseX,
@@ -2537,12 +2558,17 @@ void EmulatorQtWindow::slot_showWindow(SkinSurface* surface,
         mContainer.stopResizeTimer();
         recenterFocusPoint();
     } else if (!mNextIsZoom) {
-        mContainer.resize(rect.size());
+        mContainer.resizeForDisplay(rect.size());
     }
     mNextIsZoom = false;
 
     maskWindowFrame();
     show();
+
+    if (auto gate = StartupWindowGate::get(&mContainer)) {
+        gate->surfacePrepared(mBackingSurface && mBackingSurface->bitmap &&
+                              !mBackingSurface->bitmap->size().isEmpty());
+    }
 
     // Zooming forces the scroll bar to be visible for sizing purposes. They
     // should never be shown when not in zoom mode, and should only show when
@@ -2606,6 +2632,25 @@ void EmulatorQtWindow::showEvent(QShowEvent* event) {
                             ->test_quitAfterBootTimeOut);
         }
         mFirstShowEvent = false;
+        // Starting-up state is shown inside this window until the guest reports boot completed.
+        if (!getConsoleAgents()->settings->guest_boot_completed() &&
+            !getConsoleAgents()->settings->android_cmdLineOptions()->qt_hide_window) {
+            QTimer::singleShot(0, this, [this] {
+                if (mClosed) return;
+                mContainer.showModalOverlay(QStringLiteral(u"\u6B63\u5728\u555F\u52D5 Android\u2026"));
+                auto bootTimer = new QTimer(this);
+                bootTimer->setObjectName("androidemu_boot_overlay_timer");
+                bootTimer->setInterval(500);
+                connect(bootTimer, &QTimer::timeout, this, [this, bootTimer] {
+                    if (mClosed || getConsoleAgents()->settings->guest_boot_completed()) {
+                        if (!mClosed) mContainer.hideModalOverlay();
+                        bootTimer->stop();
+                        bootTimer->deleteLater();
+                    }
+                });
+                bootTimer->start();
+            });
+        }
     }
 }
 
@@ -3417,6 +3462,7 @@ bool EmulatorQtWindow::hasSkin() const {
 }
 
 bool EmulatorQtWindow::hasFrame() const {
+    if (mContainer.integratedUi()) return true;
     if (mFrameAlways || mInZoomMode) {
         return true;
     }
@@ -3471,10 +3517,10 @@ void EmulatorQtWindow::toggleZoomMode() {
         mContainer.setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
         mContainer.setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
 
-        doResize(mContainer.size());
+        doResize(mContainer.contentSizeForResize());
         mOverlay.hide();
     } else {
-        doResize(mContainer.size());
+        doResize(mContainer.contentSizeForResize());
         mOverlay.showForZoom();
     }
     maskWindowFrame();
@@ -3503,15 +3549,15 @@ void EmulatorQtWindow::saveZoomPoints(const QPoint& focus,
 }
 
 void EmulatorQtWindow::scaleDown() {
-    doResize(mContainer.size() / 1.1, true);
+    doResize(mContainer.contentSizeForResize() / 1.1, true);
 }
 
 void EmulatorQtWindow::scaleUp() {
-    doResize(mContainer.size() * 1.1, true);
+    doResize(mContainer.contentSizeForResize() * 1.1, true);
 }
 
 void EmulatorQtWindow::fixScale() {
-    doResize(mContainer.size(), true);
+    doResize(mContainer.contentSizeForResize(), true);
 }
 
 void EmulatorQtWindow::zoomIn() {

@@ -24,6 +24,8 @@ android_qt_lib(
       android/skin/qt/emulator-overlay.cpp
       android/skin/qt/emulator-qt-window.cpp
       android/skin/qt/event-qt.cpp
+      android/skin/qt/file-export-dialog.cpp
+      android/skin/qt/file-export-policy.cpp
       android/skin/qt/extended-window.cpp
       android/skin/qt/extended.ui
       android/skin/qt/FramelessDetector.cpp
@@ -172,3 +174,13 @@ android_add_test(
        ui-shared-stream)
 
 target_include_directories(ui-shared-stream_unittest PRIVATE src test)
+
+# Standalone policy test: no moc, adb server, guest or emulator runtime needed.
+android_add_test(
+  TARGET file-export-policy_unittest
+  SOURCE_DIR test
+  SRC FileExportPolicyTest.cpp
+  DEPS Qt${QT_VERSION_MAJOR}::Core)
+target_sources(file-export-policy_unittest PRIVATE
+               src/android/skin/qt/file-export-policy.cpp)
+target_include_directories(file-export-policy_unittest PRIVATE src)

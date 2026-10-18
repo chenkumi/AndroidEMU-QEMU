@@ -887,9 +887,7 @@ endif()
 
 if(NEED_RELINK_ASM)
   message("create_symlink ${ASM_DIR_TARGET} ${ANDROID_AUTOGEN}/asm")
-  execute_process(
-    COMMAND ${CMAKE_COMMAND} -E create_symlink "${ASM_DIR_TARGET}"
-            "${ANDROID_AUTOGEN}/asm" WORKING_DIRECTORY ${ANDROID_QEMU2_TOP_DIR})
+  android_symlink("${ASM_DIR_TARGET}" "asm" "${ANDROID_AUTOGEN}")
 endif()
 
 include(cmake-main.${ANDROID_TARGET_TAG}.inc)
@@ -923,6 +921,10 @@ android_add_library(
   NOTICE "REPO/LICENSE"
   SRC # cmake-format: sortable
       ${qemu2-shared_generated_sources} ${qemu2-shared_sources})
+if(ANDROID_TARGET_TAG STREQUAL "windows_msvc-x86_64")
+  target_sources(qemu2-common PRIVATE audio/winaudio.c)
+  target_link_libraries(qemu2-common PUBLIC winmm)
+endif()
 target_compile_definitions(qemu2-common PRIVATE "-DPOISON_CONFIG_ANDROID")
 target_compile_options(qemu2-common PRIVATE "-Wno-string-plus-int"
                                             "-Wno-return-type")

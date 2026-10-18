@@ -642,6 +642,4 @@ android_target_link_libraries(
 message(
   "Creating libchrome symlinks ${CMAKE_CURRENT_BINARY_DIR}/third_party -> ${AOSP_ROOT}/external"
 )
-execute_process(
-  COMMAND ${CMAKE_COMMAND} -E create_symlink "${AOSP_ROOT}/external"
-          "third_party" WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+android_symlink("${AOSP_ROOT}/external" "third_party" "${CMAKE_CURRENT_BINARY_DIR}")

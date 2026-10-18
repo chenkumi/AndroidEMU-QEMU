@@ -25,6 +25,7 @@
 #include "host-common/globals.h"
 
 #include <gtest/gtest.h>
+#include <cstdlib>
 
 namespace android {
 namespace base {
@@ -237,6 +238,19 @@ public:
 };
 }  // namespace android::emulation
 
+#if defined(_WIN32)
+static bool initializeRealHostGpuForConfigTest();
+class HostGpuConfigEnvironment : public ::testing::Environment {
+public:
+    void SetUp() override {
+        // Initialize before any earlier case can cache a TestSystem("foo") loader path.
+        ASSERT_TRUE(initializeRealHostGpuForConfigTest());
+    }
+};
+[[maybe_unused]] static const auto* sHostGpuConfigEnvironment =
+    ::testing::AddGlobalTestEnvironment(new HostGpuConfigEnvironment());
+#endif
+
 TEST(EmuglConfig, init) {
     TestSystem testSys("foo", System::kProgramBitness, "/");
     TestTempDir* myDir = testSys.getTempRoot();
@@ -359,8 +373,28 @@ TEST(EmuglConfig, initFromUISetting) {
     }
 }
 
+// Probe with the real launcher before TestSystem replaces it with a fake path.
+// These Windows host-selection cases require a functioning hardware Vulkan loader.
+#if defined(_WIN32)
+static bool initializeRealHostGpuForConfigTest() {
+    // Each filtered case must work without relying on EmuglConfig.init running first.
+    ::android::emulation::injectConsoleAgents(
+        android::emulation::MockAndroidConsoleFactory());
+    char* vendor = nullptr;
+    int major = 0, minor = 0, patch = 0;
+    emuglConfig_get_vulkan_hardware_gpu(&vendor, &major, &minor, &patch,
+                                      nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+    const bool available = vendor != nullptr;
+    std::free(vendor);
+    return available;
+}
+#endif
+
 // Tests to cover usages of higher level function 'androidEmuglConfigInit'
 TEST(EmuglConfig, initWithEmuglConfigInit) {
+#if defined(_WIN32)
+    ASSERT_TRUE(initializeRealHostGpuForConfigTest());
+#endif
     TestSystem testSys("foo", System::kProgramBitness, "/");
     TestTempDir* myDir = testSys.getTempRoot();
     myDir->makeSubDir(System::get()->getLauncherDirectory().c_str());
@@ -430,6 +464,9 @@ TEST(EmuglConfig, initWithEmuglConfigInit) {
 }
 
 TEST(EmuglConfig, initWithEmuglConfigInitApiLevel) {
+#if defined(_WIN32)
+    ASSERT_TRUE(initializeRealHostGpuForConfigTest());
+#endif
     TestSystem testSys("foo", System::kProgramBitness, "/");
     TestTempDir* myDir = testSys.getTempRoot();
     myDir->makeSubDir(System::get()->getLauncherDirectory().c_str());

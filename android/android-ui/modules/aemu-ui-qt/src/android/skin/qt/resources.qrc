@@ -269,6 +269,8 @@
         <file alias="display_mode_tablet_expand">images/light/tablet_expand.svg</file>
         <file alias="display_mode_desktop">images/light/laptop_mode.svg</file>
         <file alias="display_mode_desktop_expand">images/light/desktop_expand.svg</file>
+        <file alias="export_files">images/light/lucide-added_folder-sync.svg</file>
+        <file alias="fullscreen">images/light/lucide-added_maximize.svg</file>
     </qresource>
     <qresource prefix="/dark">
         <!-- Main list of tool buttons -->
@@ -489,6 +491,8 @@
         <file alias="display_mode_tablet_expand">images/dark/tablet_expand.svg</file>
         <file alias="display_mode_desktop">images/dark/laptop_mode_dark.svg</file>
         <file alias="display_mode_desktop_expand">images/dark/desktop_expand.svg</file>
+        <file alias="export_files">images/dark/lucide-added_folder-sync.svg</file>
+        <file alias="fullscreen">images/dark/lucide-added_maximize.svg</file>
      </qresource>
 
     <qresource prefix="/studio-light">

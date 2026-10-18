@@ -63,19 +63,39 @@ typedef struct BDRVRawState {
     int type;
     char drive_path[16]; /* format: "d:\" */
     QEMUWin32AIOState *aio;
+    bool sparse; /* discard=unmap on a writable file: discards punch holes */
 #ifdef CONFIG_BLOCK_DELAYED_FLUSH
     QEMUTimer flush_timer;
     bool flush_timer_running;
 #endif
 } BDRVRawState;
 
+/* Keep unknown Win32 I/O failures conservative, rather than treating them as EOF. */
+static int win32_io_errno(DWORD error)
+{
+    switch (error) {
+    case ERROR_ACCESS_DENIED:
+        return EACCES;
+    case ERROR_DISK_FULL:
+    case ERROR_HANDLE_DISK_FULL:
+        return ENOSPC;
+    case ERROR_INVALID_HANDLE:
+        return EBADF;
+    case ERROR_INVALID_PARAMETER:
+        return EINVAL;
+    case ERROR_FILE_TOO_LARGE:
+        return EFBIG;
+    default:
+        return EIO;
+    }
+}
+
 /*
- * Read/writes the data to/from a given linear buffer.
- *
- * Returns the number of bytes handles or -errno in case of an error. Short
- * reads are only returned if the end of the file is reached.
+ * Read/write vectors, returning the byte count or -errno even after partial I/O.
+ * Successful short reads and ERROR_HANDLE_EOF are genuine EOF.
+ * paio_submit bounds the total request size to a non-negative int.
  */
-static size_t handle_aiocb_rw(RawWin32AIOData *aiocb)
+static ssize_t handle_aiocb_rw_vector(RawWin32AIOData *aiocb)
 {
     size_t offset = 0;
     int i;
@@ -87,16 +107,33 @@ static size_t handle_aiocb_rw(RawWin32AIOData *aiocb)
         memset(&ov, 0, sizeof(ov));
         ov.Offset = (aiocb->aio_offset + offset);
         ov.OffsetHigh = (aiocb->aio_offset + offset) >> 32;
+        void *base = aiocb->aio_iov[i].iov_base;
         len = aiocb->aio_iov[i].iov_len;
+        /* Adjacent memory vectors cover consecutive file offsets. Combine
+         * them without a bounce allocation; retain partial/error handling. */
+        while (len && i + 1 < aiocb->aio_niov &&
+               aiocb->aio_iov[i + 1].iov_len &&
+               aiocb->aio_iov[i + 1].iov_len <= UINT32_MAX - len &&
+               (uintptr_t)base <= UINTPTR_MAX - len &&
+               (uintptr_t)base + len ==
+                   (uintptr_t)aiocb->aio_iov[i + 1].iov_base) {
+            len += aiocb->aio_iov[++i].iov_len;
+        }
         if (aiocb->aio_type & QEMU_AIO_WRITE) {
-            ret = WriteFile(aiocb->hfile, aiocb->aio_iov[i].iov_base,
+            ret = WriteFile(aiocb->hfile, base,
                             len, &ret_count, &ov);
         } else {
-            ret = ReadFile(aiocb->hfile, aiocb->aio_iov[i].iov_base,
+            ret = ReadFile(aiocb->hfile, base,
                            len, &ret_count, &ov);
         }
         if (!ret) {
-            ret_count = 0;
+            DWORD error = GetLastError();
+            if (!(aiocb->aio_type & QEMU_AIO_WRITE) &&
+                error == ERROR_HANDLE_EOF) {
+                break;
+            }
+            /* Even after earlier vectors succeeded, an I/O failure is not EOF. */
+            return -win32_io_errno(error);
         }
         if (ret_count != len) {
             offset += ret_count;
@@ -106,6 +143,43 @@ static size_t handle_aiocb_rw(RawWin32AIOData *aiocb)
     }
 
     return offset;
+}
+
+/* The block layer aligns the whole request, not each constituent iovec.
+ * NO_BUFFERING cannot read a 104-byte qcow2 header separately from its padding.
+ * Coalesce only misaligned direct requests; leave buffered/aligned I/O alone.
+ * Never round writes here: the block layer owns read-modify-write serialization.
+ */
+static ssize_t handle_aiocb_rw(RawWin32AIOData *aiocb)
+{
+    RawWin32AIOData aligned;
+    struct iovec iov;
+    ssize_t count;
+    void *buffer;
+
+    if (!(aiocb->aio_type & QEMU_AIO_MISALIGNED)) {
+        return handle_aiocb_rw_vector(aiocb);
+    }
+    buffer = qemu_try_blockalign(aiocb->bs, aiocb->aio_nbytes);
+    if (!buffer) {
+        return -ENOMEM;
+    }
+    if (aiocb->aio_type & QEMU_AIO_WRITE) {
+        iov_to_buf(aiocb->aio_iov, aiocb->aio_niov, 0,
+                   buffer, aiocb->aio_nbytes);
+    }
+    aligned = *aiocb;
+    iov.iov_base = buffer;
+    iov.iov_len = aiocb->aio_nbytes;
+    aligned.aio_iov = &iov;
+    aligned.aio_niov = 1;
+    count = handle_aiocb_rw_vector(&aligned);
+    if (!(aiocb->aio_type & QEMU_AIO_WRITE) && count > 0) {
+        /* Copy only bytes actually read, never uninitialized EOF/error data. */
+        iov_from_buf(aiocb->aio_iov, aiocb->aio_niov, 0, buffer, count);
+    }
+    qemu_vfree(buffer);
+    return count;
 }
 
 #ifdef CONFIG_BLOCK_DELAYED_FLUSH
@@ -124,12 +198,16 @@ static int aio_worker(void *arg)
 {
     RawWin32AIOData *aiocb = arg;
     ssize_t ret = 0;
-    size_t count;
+    ssize_t count;
 
     switch (aiocb->aio_type & QEMU_AIO_TYPE_MASK) {
     case QEMU_AIO_READ:
         count = handle_aiocb_rw(aiocb);
-        if (count < aiocb->aio_nbytes) {
+        if (count < 0) {
+            ret = count;
+            break;
+        }
+        if ((size_t)count < aiocb->aio_nbytes) {
             /* A short read means that we have reached EOF. Pad the buffer
              * with zeros for bytes after EOF. */
             iov_memset(aiocb->aio_iov, aiocb->aio_niov, count,
@@ -137,7 +215,7 @@ static int aio_worker(void *arg)
 
             count = aiocb->aio_nbytes;
         }
-        if (count == aiocb->aio_nbytes) {
+        if ((size_t)count == aiocb->aio_nbytes) {
             ret = 0;
         } else {
             ret = -EINVAL;
@@ -145,7 +223,11 @@ static int aio_worker(void *arg)
         break;
     case QEMU_AIO_WRITE:
         count = handle_aiocb_rw(aiocb);
-        if (count == aiocb->aio_nbytes) {
+        if (count < 0) {
+            ret = count;
+            break;
+        }
+        if ((size_t)count == aiocb->aio_nbytes) {
             ret = 0;
         } else {
             ret = -EINVAL;
@@ -161,7 +243,7 @@ static int aio_worker(void *arg)
         }
 #else  // !CONFIG_BLOCK_DELAYED_FLUSH
         if (!FlushFileBuffers(aiocb->hfile)) {
-            return -EIO;
+            ret = -EIO;
         }
 #endif
         break;
@@ -191,6 +273,10 @@ static BlockAIOCB *paio_submit(BlockDriverState *bs, HANDLE hfile,
         acb->aio_iov = qiov->iov;
         acb->aio_niov = qiov->niov;
         assert(qiov->size == count);
+        if ((bs->open_flags & BDRV_O_NOCACHE) &&
+            !bdrv_qiov_is_aligned(bs, qiov)) {
+            acb->aio_type |= QEMU_AIO_MISALIGNED;
+        }
     }
     acb->aio_nbytes = count;
     acb->aio_offset = offset;
@@ -207,29 +293,46 @@ int qemu_ftruncate64(int fd, int64_t length)
     LONG high;
     HANDLE h;
     BOOL res;
+    int saved_errno;
 
-    if ((GetVersion() & 0x80000000UL) && (length >> 32) != 0)
-	return -1;
+    if (length < 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    if ((GetVersion() & 0x80000000UL) && (length >> 32) != 0) {
+        errno = EFBIG;
+        return -1;
+    }
 
     h = (HANDLE)_get_osfhandle(fd);
 
     /* get current position, ftruncate do not change position */
     li.HighPart = 0;
+    SetLastError(NO_ERROR);
     li.LowPart = SetFilePointer (h, 0, &li.HighPart, FILE_CURRENT);
     if (li.LowPart == INVALID_SET_FILE_POINTER && GetLastError() != NO_ERROR) {
-	return -1;
+        errno = win32_io_errno(GetLastError());
+        return -1;
     }
 
     high = length >> 32;
+    SetLastError(NO_ERROR);
     dw = SetFilePointer(h, (DWORD) length, &high, FILE_BEGIN);
     if (dw == INVALID_SET_FILE_POINTER && GetLastError() != NO_ERROR) {
-	return -1;
+        errno = win32_io_errno(GetLastError());
+        return -1;
     }
     res = SetEndOfFile(h);
+    /* Capture the failure before restoring the file position changes last-error. */
+    saved_errno = res ? 0 : win32_io_errno(GetLastError());
 
     /* back to old position */
     SetFilePointer(h, li.LowPart, &li.HighPart, FILE_BEGIN);
-    return res ? 0 : -1;
+    if (!res) {
+        errno = saved_errno;
+        return -1;
+    }
+    return 0;
 }
 
 static int set_sparse(int fd)
@@ -352,6 +455,51 @@ static bool get_aio_option(QemuOpts *opts, int flags, Error **errp)
     return false;
 }
 
+/*
+ * Synchronous FSCTL on a handle that may be overlapped and bound to an I/O
+ * completion port. The low bit on hEvent keeps the completion off the port, so
+ * the win32 AIO loop never sees it.
+ */
+static bool raw_fsctl(HANDLE h, DWORD code, void *in, DWORD in_size)
+{
+    OVERLAPPED ov;
+    DWORD returned;
+    HANDLE event = CreateEvent(NULL, TRUE, FALSE, NULL);
+    BOOL ok;
+
+    if (!event) {
+        return false;
+    }
+    memset(&ov, 0, sizeof(ov));
+    ov.hEvent = (HANDLE)((uintptr_t)event | 1);
+    ok = DeviceIoControl(h, code, in, in_size, NULL, 0, &returned, &ov);
+    if (!ok && GetLastError() == ERROR_IO_PENDING) {
+        ok = GetOverlappedResult(h, &ov, &returned, TRUE);
+    }
+    CloseHandle(event);
+    return ok;
+}
+
+/*
+ * Guest discard reaches here only for host ranges qcow2 no longer references.
+ * Deallocate them so the image file shrinks on disk. A host that cannot punch
+ * holes simply keeps the data; the guest request still succeeds.
+ */
+static int coroutine_fn raw_co_pdiscard(BlockDriverState *bs, int64_t offset,
+                                        int bytes)
+{
+    BDRVRawState *s = bs->opaque;
+    FILE_ZERO_DATA_INFORMATION range;
+
+    if (!s->sparse) {
+        return -ENOTSUP;
+    }
+    range.FileOffset.QuadPart = offset;
+    range.BeyondFinalZero.QuadPart = offset + bytes;
+    return raw_fsctl(s->hfile, FSCTL_SET_ZERO_DATA, &range, sizeof(range))
+           ? 0 : -ENOTSUP;
+}
+
 static int raw_open(BlockDriverState *bs, QDict *options, int flags,
                     Error **errp)
 {
@@ -416,6 +564,10 @@ static int raw_open(BlockDriverState *bs, QDict *options, int flags,
         }
         goto fail;
     }
+
+    /* Only a sparse file can deallocate ranges without writing zeros. */
+    s->sparse = (flags & BDRV_O_UNMAP) && (flags & BDRV_O_RDWR) &&
+                raw_fsctl(s->hfile, FSCTL_SET_SPARSE, NULL, 0);
 
     if (use_aio) {
         s->aio = win32_aio_init();
@@ -624,7 +776,13 @@ static int raw_co_create(BlockdevCreateOptions *options, Error **errp)
         return -EIO;
     }
     set_sparse(fd);
-    ftruncate(fd, file_opts->size);
+    if (ftruncate(fd, file_opts->size) < 0) {
+        int saved_errno = errno;
+        error_setg_errno(errp, saved_errno, "Could not resize file");
+        qemu_close(fd);
+        errno = saved_errno;
+        return -saved_errno;
+    }
     qemu_close(fd);
 
     return 0;
@@ -675,6 +833,7 @@ BlockDriver bdrv_file = {
     .bdrv_parse_filename = raw_parse_filename,
     .bdrv_file_open     = raw_open,
     .bdrv_refresh_limits = raw_probe_alignment,
+    .bdrv_co_pdiscard   = raw_co_pdiscard,
     .bdrv_close         = raw_close,
     .bdrv_co_create_opts = raw_co_create_opts,
     .bdrv_has_zero_init = bdrv_has_zero_init_1,

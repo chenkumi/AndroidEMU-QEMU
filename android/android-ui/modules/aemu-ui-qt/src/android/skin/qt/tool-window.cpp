@@ -11,6 +11,7 @@
  */
 
 #include "android/skin/qt/tool-window.h"
+#include "android/skin/qt/file-export-dialog.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <unistd.h>
@@ -83,6 +84,9 @@
 #include "android/skin/android_keycodes.h"
 #include "android/skin/event.h"
 #include "android/skin/linux_keycodes.h"
+#include <QToolButton>
+#include <QStyle>
+#include "android/skin/qt/emulator-container.h"
 #include "android/skin/qt/emulator-qt-window.h"
 #include "android/skin/qt/extended-pages/common.h"
 #include "android/skin/qt/extended-pages/virtual-sensors-page.h"
@@ -261,6 +265,68 @@ ToolWindow::ToolWindow(EmulatorQtWindow* window,
 #endif
     setWindowFlags(flag | Qt::FramelessWindowHint | Qt::NoDropShadowWindowHint);
     mToolsUi->setupUi(this);
+    auto exportFiles = new QToolButton(this);
+    exportFiles->setObjectName("export_files_button");
+    exportFiles->setToolTip(tr("Transfer files with shared Android storage"));
+    exportFiles->setAccessibleName(tr("Transfer files with shared Android storage"));
+#ifdef _WIN32
+    const SettingsTheme exportIconTheme = mEmulatorWindow->containerWindow()->integratedUi() ? SETTINGS_THEME_DARK : getSelectedTheme();
+#else
+    const SettingsTheme exportIconTheme = getSelectedTheme();
+#endif
+    exportFiles->setIcon(getIconForTheme("export_files", exportIconTheme));
+    exportFiles->setFixedSize(40, 34);
+    exportFiles->setIconSize(QSize(20, 20));
+    mToolsUi->controlsLayout->addWidget(exportFiles, 0, Qt::AlignHCenter);
+    connect(exportFiles, &QToolButton::clicked, this, [this] {
+        if (auto dialog = findChild<QDialog*>("file_export_dialog", Qt::FindDirectChildrenOnly)) {
+            dialog->show();
+            dialog->raise();
+            dialog->activateWindow();
+            return;
+        }
+        auto adb = mEmulatorWindow->getAdbInterface();
+        if (!adb || adb->adbPath().empty() || adb->serialString().empty()) {
+            QMessageBox::warning(this, tr("Export files"),
+                                 tr("This emulator window has no configured ADB device."));
+            return;
+        }
+        auto dialog = new FileExportDialog(
+                QString::fromStdString(adb->adbPath()),
+                QString::fromStdString(adb->serialString()), this);
+        dialog->show();
+    });
+#ifdef _WIN32
+    if (mEmulatorWindow->containerWindow()->integratedUi()) {
+        setWindowFlags(Qt::Widget);
+        mToolsUi->close_button->hide();
+        mToolsUi->minimize_button->hide();
+        mToolsUi->next_layout_button->hide();
+        auto fullscreen = new QToolButton(this);
+        fullscreen->setObjectName("fullscreen_button");
+        fullscreen->setToolTip(tr("Full screen (F11)"));
+        fullscreen->setIcon(getIconForTheme("fullscreen", SETTINGS_THEME_DARK));
+        fullscreen->setFixedSize(40, 40);
+        mToolsUi->controlsLayout->addWidget(fullscreen, 0, Qt::AlignHCenter);
+        connect(fullscreen, &QToolButton::clicked, this, [this] {
+            mEmulatorWindow->containerWindow()->toggleFullScreen();
+        });
+        mToolsUi->mainLayout->setContentsMargins(0, 4, 0, 4);
+        mToolsUi->controlsLayout->setContentsMargins(2, 0, 2, 4);
+        mToolsUi->controlsLayout->setSpacing(2);
+        for (auto button : findChildren<QPushButton*>()) {
+            button->setFixedSize(40, 34);
+            mToolsUi->controlsLayout->setAlignment(button, Qt::AlignHCenter);
+            button->setIconSize(QSize(20, 20));
+        }
+        fullscreen->setFixedSize(40, 34);
+        fullscreen->setIconSize(QSize(20, 20));
+        setMinimumSize(0, 0);
+        setMaximumSize(QWIDGETSIZE_MAX, QWIDGETSIZE_MAX);
+        mToolsUi->mainLayout->activate();
+        adjustSize();
+    }
+#endif
 
     const AvdInfo* avdInfo = getConsoleAgents()->settings->avdInfo();
     const AvdFlavor avdFlavor = avdInfo ? avdInfo_getAvdFlavor(avdInfo) : AVD_OTHER;
@@ -480,6 +546,12 @@ ToolWindow::ToolWindow(EmulatorQtWindow* window,
     // Android doesn't support tablet mode now.
     mToolsUi->tablet_mode_button->setHidden(true);
 
+    if (mEmulatorWindow->containerWindow()->integratedUi()) {
+        mToolsUi->prev_layout_button->setToolTip(
+                tr("Portrait / Landscape (Ctrl+Left or Ctrl+Right)"));
+        mToolsUi->prev_layout_button->setAccessibleName(tr("Portrait / Landscape"));
+    }
+
     if (avdFlavor == AVD_TV) {
         // Android TV should not rotate
         // TODO: emulate VESA mounts for use with
@@ -648,6 +720,42 @@ ToolWindow::ToolWindow(EmulatorQtWindow* window,
     remaskButtons();
     installEventFilter(this);
 
+#ifdef _WIN32
+    if (mEmulatorWindow->containerWindow()->integratedUi()) {
+        // Integrated rail order, top to bottom: power, volume up/down, screenshot,
+        // zoom, rotate, (file transfer, full screen), flexible space, settings,
+        // back, home, overview. Done last so flavor-specific code above cannot
+        // move the buttons again.
+        auto controls = mToolsUi->controlsLayout;
+        mToolsUi->more_button->setToolTip(tr("Settings"));
+        mToolsUi->more_button->setAccessibleName(tr("Settings"));
+        QWidget* const top[] = {
+                mToolsUi->power_button, mToolsUi->volume_up_button,
+                mToolsUi->volume_down_button, mToolsUi->scrShot_button,
+                mToolsUi->zoom_button, mToolsUi->prev_layout_button,
+                findChild<QToolButton*>("export_files_button"),
+                findChild<QToolButton*>("fullscreen_button")};
+        QWidget* const bottom[] = {
+                mToolsUi->more_button, mToolsUi->back_button,
+                mToolsUi->home_button, mToolsUi->overview_button};
+        for (auto w : top) if (w) controls->removeWidget(w);
+        for (auto w : bottom) controls->removeWidget(w);
+        int index = 0;
+        for (auto w : top) if (w) controls->insertWidget(index++, w, 0, Qt::AlignHCenter);
+        controls->addStretch(1);
+        for (auto w : bottom) controls->addWidget(w, 0, Qt::AlignHCenter);
+        // The window grows with the rail so the stretch can push the bottom group down.
+        // A Fixed size policy makes QScrollArea cap the widget at its size hint.
+        setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Expanding);
+        mToolsUi->mainLayout->setSizeConstraint(QLayout::SetDefaultConstraint);
+        // SetFixedSize pinned min and max to the old content size; leaving the constraint does not undo that.
+        setMinimumSize(0, 0);
+        setMaximumSize(QWIDGETSIZE_MAX, QWIDGETSIZE_MAX);
+        mToolsUi->mainLayout->setAlignment(Qt::Alignment());
+        controls->setAlignment(Qt::Alignment());
+    }
+#endif
+
     mSleepTimer.setSingleShot(true);
     connect(&mSleepTimer, SIGNAL(timeout()), this, SLOT(onSleepTimerDone()));
     mUnfoldTimer.setSingleShot(true);
@@ -655,6 +763,8 @@ ToolWindow::ToolWindow(EmulatorQtWindow* window,
 }
 
 ToolWindow::~ToolWindow() {
+    if (auto dialog = findChild<QDialog*>("file_export_dialog", Qt::FindDirectChildrenOnly))
+        dialog->reject();
     auto notifier = static_cast<android::base::EventNotificationSupport<bool>*>(
             getConsoleAgents()->vm->getRealAudioEventListener());
     mFoldableSyncToAndroid.enqueue({
@@ -850,7 +960,11 @@ void ToolWindow::hideEvent(QHideEvent*) {
 
 void ToolWindow::show() {
     QFrame::show();
-    setFixedSize(size());
+#ifdef _WIN32
+    // The integrated rail resizes this window with the container; pinning it would stop the flexible space.
+    if (!mEmulatorWindow->containerWindow()->integratedUi())
+#endif
+        setFixedSize(size());
 
     if (mIsVirtualSceneWindowVisibleOnShow) {
         mVirtualSceneControlWindow.get()->show();
@@ -1148,6 +1262,12 @@ void ToolWindow::handleUICommand(QtUICommand cmd,
                 const int fromState = sUiEmuAgent->window->getRotation();
                 const bool isRight = cmd == QtUICommand::ROTATE_RIGHT;
                 SkinRotation nextRotation = SKIN_ROTATION_0;
+                if (mEmulatorWindow->containerWindow()->integratedUi()) {
+                    // Use two canonical poses; never cycle through inverted views.
+                    nextRotation = (fromState == SKIN_ROTATION_0 ||
+                                    fromState == SKIN_ROTATION_180)
+                            ? SKIN_ROTATION_270 : SKIN_ROTATION_0;
+                } else {
                 switch (fromState) {
                     case SKIN_ROTATION_0:
                         nextRotation =
@@ -1165,6 +1285,7 @@ void ToolWindow::handleUICommand(QtUICommand cmd,
                         nextRotation =
                                 isRight ? SKIN_ROTATION_0 : SKIN_ROTATION_180;
                         break;
+                }
                 }
 
                 sUiEmuAgent->sensors->setCoarseOrientation(
@@ -1545,6 +1666,7 @@ void ToolWindow::closeExtendedWindow() {
 }
 
 void ToolWindow::dockMainWindow() {
+    if (!isWindow()) return;
     // Align horizontally relative to the main window's frame.
     // Align vertically to its contents.
     // If we're frameless, adjust for a transparent border
@@ -1577,6 +1699,18 @@ void ToolWindow::updateTheme(const QString& styleSheet) {
             [&] { mVirtualSceneControlWindow.get()->updateTheme(styleSheet); });
     mTouchpadWindow.ifExists(
             [&] { mTouchpadWindow.get()->setStyleSheet(styleSheet); });
+#ifdef _WIN32
+    if (mEmulatorWindow->containerWindow()->integratedUi()) {
+        adjustAllButtonsForTheme(SETTINGS_THEME_DARK);
+        setStyleSheet(Ui::stylesheetForTheme(SETTINGS_THEME_DARK) +
+            "\nQFrame#ToolControls { background:#202332; border:0; }"
+            "QPushButton, QToolButton { background:transparent; border:0; border-radius:4px; color:#dce0ec; padding:0; }"
+            "QPushButton:hover, QToolButton:hover { background:#353b51; }"
+            "QPushButton:pressed, QToolButton:pressed { background:#4b5573; }"
+            "QPushButton:disabled, QToolButton:disabled { color:#737b91; }");
+        return;
+    }
+#endif
     setStyleSheet(styleSheet);
 }
 
@@ -1816,6 +1950,8 @@ bool ToolWindow::shouldClose() {
 }
 
 void ToolWindow::on_close_button_clicked() {
+    if (auto dialog = findChild<QDialog*>("file_export_dialog", Qt::FindDirectChildrenOnly))
+        dialog->reject();
     mIsExiting = true;
     setEnabled(false);
     mCloseClicked = true;
@@ -2397,7 +2533,13 @@ void ToolWindow::on_more_button_clicked() {
     }
 }
 
-void ToolWindow::paintEvent(QPaintEvent*) {
+void ToolWindow::paintEvent(QPaintEvent* event) {
+#ifdef _WIN32
+    if (mEmulatorWindow->containerWindow()->integratedUi()) {
+        QFrame::paintEvent(event);
+        return;
+    }
+#endif
     QPainter p;
     QPen pen(Qt::SolidLine);
     pen.setColor(Qt::black);
@@ -2437,7 +2579,7 @@ void ToolWindow::touchExtendedWindow() {
 }
 
 void ToolWindow::enableCloseButton() {
-    mToolsUi->close_button->setVisible(true);
+    if (isWindow()) mToolsUi->close_button->setVisible(true);
 }
 
 void ToolWindow::hideRotationButton(bool hide) {
@@ -2451,7 +2593,8 @@ void ToolWindow::hideRotationButton(bool hide) {
         return;
     } else {
         mToolsUi->prev_layout_button->setHidden(hide);
-        mToolsUi->next_layout_button->setHidden(hide);
+        mToolsUi->next_layout_button->setHidden(
+                hide || mEmulatorWindow->containerWindow()->integratedUi());
     }
 }
 

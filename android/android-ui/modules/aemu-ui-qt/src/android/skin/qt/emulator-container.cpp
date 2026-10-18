@@ -22,6 +22,8 @@
 #include <QObject>        // for QObject
 #include <QPoint>         // for QPoint
 #include <QScrollBar>     // for QScrollBar
+#include <QShortcut>
+#include <QPushButton>
 #include <QStyle>         // for QStyle
 #include <QStyleFactory>  // for QStyleFactory
 #include <QVector2D>      // for QVector2D
@@ -59,7 +61,33 @@ class QStyle;
 
 #if defined(_WIN32)
 #include "android/skin/qt/windows-native-window.h"
+#include <qt_windows.h>
+#include <QLibrary>
+#include "android/skin/qt/startup-window-gate.h"
 #endif
+
+// Reserve equal space opposite the scrollbar so buttons stay centered in the whole rail.
+class IntegratedToolRail final : public QScrollArea {
+public:
+    explicit IntegratedToolRail(QWidget* parent) : QScrollArea(parent) {
+        connect(verticalScrollBar(), &QScrollBar::rangeChanged, this, [this](int low, int high) {
+            setViewportMargins(high > low ? 6 : 0, 0, 0, 0);
+        });
+    }
+    // Give the tool window the full rail height when it fits, so the flexible space in
+    // its layout pushes the bottom button group down; otherwise keep the minimum and scroll.
+    void fitTools() {
+        if (auto tools = widget()) {
+            const int height = qMax(this->height(), tools->minimumSizeHint().height());
+            if (tools->height() != height) tools->resize(tools->width(), height);
+        }
+    }
+protected:
+    void resizeEvent(QResizeEvent* event) override {
+        QScrollArea::resizeEvent(event);
+        fitTools();
+    }
+};
 
 static constexpr int kEventBufferSize = 8;
 
@@ -68,6 +96,19 @@ EmulatorContainer::EmulatorContainer(EmulatorQtWindow* window)
     mEventBuffer.reserve(kEventBufferSize);
     setFrameShape(QFrame::NoFrame);
     setWidget(window);
+#ifdef _WIN32
+    mIntegratedUi = !getConsoleAgents()->settings->android_cmdLineOptions()->qt_hide_window;
+    if (mIntegratedUi) {
+        setObjectName("integrated_emulator_frame");
+        viewport()->setObjectName("integrated_display_viewport");
+        setStyleSheet("QScrollArea#integrated_emulator_frame { background:#202332; border:0; }"
+                      "QWidget#integrated_display_viewport { background:#202332; border:0; }");
+        setAlignment(Qt::AlignCenter);
+        new StartupWindowGate(this, window);
+        auto fullscreen = new QShortcut(QKeySequence(Qt::Key_F11), this);
+        connect(fullscreen, &QShortcut::activated, this, &EmulatorContainer::toggleFullScreen);
+    }
+#endif
 
     setMinimumSize({200, 200});
 
@@ -219,7 +260,7 @@ bool EmulatorContainer::event(QEvent* e) {
 #endif
             // clear() deallocates internal buffer, but we need it.
             mEventBuffer.erase(mEventBuffer.begin(), mEventBuffer.end());
-            mEmulatorWindow->doResize(this->size());
+            mEmulatorWindow->doResize(contentSizeForResize());
 
             // Kill the resize timer to avoid double resizes.
             stopResizeTimer();
@@ -251,7 +292,7 @@ void EmulatorContainer::changeEvent(QEvent* event) {
             // OS-level window has changed to a maximized state. We do not want
             // to ignore this state change, we just want to counteract the
             // effects it had.
-            if (windowState() & Qt::WindowMaximized) {
+            if ((windowState() & Qt::WindowMaximized) && !mIntegratedUi) {
                 // BUG: 142088252 On macOS, if the emulator window
                 // - coincides with the monitor dimensions
                 // - the host's device pixel ratio is 1,
@@ -305,6 +346,10 @@ void EmulatorContainer::changeEvent(QEvent* event) {
                 }
             }
 
+            if (mToolRail) {
+                mToolRail->setVisible(!isFullScreen());
+                setViewportMargins(0, 0, isFullScreen() ? 0 : mToolRailWidth, 0);
+            }
             break;
 
         case QEvent::ActivationChange:
@@ -388,6 +433,10 @@ void EmulatorContainer::moveEvent(QMoveEvent* event) {
 
 void EmulatorContainer::resizeEvent(QResizeEvent* event) {
     QScrollArea::resizeEvent(event);
+    if (mToolRail) {
+        mToolRail->setGeometry(width() - mToolRailWidth, 0, mToolRailWidth, height());
+        static_cast<IntegratedToolRail*>(mToolRail)->fitTools();
+    }
     mEmulatorWindow->simulateZoomedWindowResized(this->viewportSize());
     adjustModalOverlayGeometry();
     adjustVirtualSceneDialogGeometry();
@@ -409,6 +458,24 @@ void EmulatorContainer::resizeEvent(QResizeEvent* event) {
 }
 
 void EmulatorContainer::showEvent(QShowEvent* event) {
+#ifdef _WIN32
+    if (mIntegratedUi) {
+        // Keep native resize, snap and caption controls; match the client chrome.
+        static QLibrary dwm(QStringLiteral("C:/Windows/System32/dwmapi.dll"));
+        using SetAttribute = HRESULT(WINAPI*)(HWND, DWORD, LPCVOID, DWORD);
+        static auto setAttribute = reinterpret_cast<SetAttribute>(dwm.resolve("DwmSetWindowAttribute"));
+        if (setAttribute) {
+            HWND handle = reinterpret_cast<HWND>(effectiveWinId());
+            const BOOL dark = TRUE;
+            const COLORREF chrome = RGB(32, 35, 50);
+            const COLORREF text = RGB(220, 224, 236);
+            setAttribute(handle, 20, &dark, sizeof(dark));
+            setAttribute(handle, 34, &chrome, sizeof(chrome));
+            setAttribute(handle, 35, &chrome, sizeof(chrome));
+            setAttribute(handle, 36, &text, sizeof(text));
+        }
+    }
+#endif
 // Disable the minimize and maximize buttons on OSX. See the comment in the
 // constructor for an explanation of why this is necessary.
 #ifdef __APPLE__
@@ -487,6 +554,11 @@ void EmulatorContainer::show() {
     }
     QScrollArea::show();
 }
+void EmulatorContainer::setVisible(bool visible) {
+    auto gate = StartupWindowGate::get(this);
+    if (visible && gate && !gate->requestShow()) return;
+    QScrollArea::setVisible(visible);
+}
 void EmulatorContainer::showMinimized() {
 // Some Linux window managers (specifically, Compiz, which is the default
 // Ubuntu window manager) will not allow minimizing unless the minimize
@@ -503,7 +575,65 @@ void EmulatorContainer::stopResizeTimer() {
     mResizeTimer.stop();
 }
 
+void EmulatorContainer::attachToolWindow(ToolWindow* tools) {
+    if (!mIntegratedUi) return;
+    mToolRail = new IntegratedToolRail(this);
+    mToolRail->setObjectName("integrated_tool_rail");
+    mToolRail->viewport()->setObjectName("integrated_tool_viewport");
+    mToolRail->setStyleSheet(
+        "QScrollArea#integrated_tool_rail, QWidget#integrated_tool_viewport { background:#202332; border:0; }"
+        "QScrollBar:vertical { background:#202332; width:6px; margin:0; }"
+        "QScrollBar::handle:vertical { background:#515970; min-height:24px; border-radius:3px; }"
+        "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height:0; }"
+        "QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background:none; }");
+    mToolRail->setFrameShape(QFrame::NoFrame);
+    mToolRail->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    mToolRail->setVerticalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+    mToolRail->setAlignment(Qt::AlignHCenter | Qt::AlignTop);
+    mToolRail->setWidget(tools);
+    mToolRailWidth = 56;
+    setViewportMargins(0, 0, mToolRailWidth, 0);
+    mToolRail->setGeometry(width() - mToolRailWidth, 0, mToolRailWidth, height());
+    static_cast<IntegratedToolRail*>(mToolRail)->fitTools();
+    mToolRail->show();
+    QTimer::singleShot(1000, this, [this, tools] {
+        for (auto button : tools->findChildren<QPushButton*>()) {
+            if (!button->isVisible()) continue;
+            int center = button->mapTo(mToolRail, QPoint(button->width() / 2, 0)).x();
+            VERBOSE_PRINT(init, "Integrated control %s center=%d railCenter=%d toolWidth=%d viewportWidth=%d",
+                          button->objectName().toUtf8().constData(), center, mToolRail->width() / 2,
+                          tools->width(), mToolRail->viewport()->width());
+        }
+    });
+}
+
+void EmulatorContainer::detachToolWindow() {
+    // EmulatorQtWindow explicitly owns and deletes ToolWindow.
+    if (mToolRail) mToolRail->takeWidget();
+}
+
+void EmulatorContainer::resizeForDisplay(const QSize& displaySize) {
+    if (mIntegratedUi && (isFullScreen() || isMaximized())) return;
+    resize(displaySize + QSize(mIntegratedUi ? mToolRailWidth : 0, 0));
+}
+
+QSize EmulatorContainer::contentSizeForResize() const {
+    return mIntegratedUi ? viewportSize() : size();
+}
+
+void EmulatorContainer::toggleFullScreen() {
+    if (!mIntegratedUi) return;
+    if (isFullScreen()) {
+        if (mWasMaximizedBeforeFullscreen) showMaximized();
+        else showNormal();
+    } else {
+        mWasMaximizedBeforeFullscreen = isMaximized();
+        showFullScreen();
+    }
+}
+
 QSize EmulatorContainer::viewportSize() const {
+    if (mIntegratedUi) return viewport()->size();
     QSize output = this->size();
 
     QScrollBar* vertical = this->verticalScrollBar();
@@ -550,7 +680,7 @@ void EmulatorContainer::slot_resizeDone() {
     // are held down. If there are, then the user must not be done resizing
     // yet.
     if (numHeldMouseButtons() == 0) {
-        mEmulatorWindow->doResize(this->size());
+        mEmulatorWindow->doResize(contentSizeForResize());
     } else {
         startResizeTimer();
     }

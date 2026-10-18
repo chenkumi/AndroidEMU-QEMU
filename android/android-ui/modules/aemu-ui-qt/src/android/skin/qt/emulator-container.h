@@ -29,6 +29,7 @@
 #include "host-common/MultiDisplay.h"
 
 class EmulatorQtWindow;
+class ToolWindow;
 class QCloseEvent;
 class QFocusEvent;
 class QKeyEvent;
@@ -61,10 +62,17 @@ public:
     void showEvent(QShowEvent* event) override;
 
     void show();
+    void setVisible(bool visible) override;
     void showMinimized();
 
     void stopResizeTimer();
     QSize viewportSize() const;
+    bool integratedUi() const { return mIntegratedUi; }
+    void attachToolWindow(ToolWindow* tools);
+    void detachToolWindow();
+    void resizeForDisplay(const QSize& displaySize);
+    QSize contentSizeForResize() const;
+    void toggleFullScreen();
 
     void prepareForRotation() { mRotating = true; }
 
@@ -110,6 +118,10 @@ private:
     QList<QEvent::Type> mEventBuffer;
     QTimer mResizeTimer;
     bool mRotating = false;
+    bool mIntegratedUi = false;
+    bool mWasMaximizedBeforeFullscreen = false;
+    int mToolRailWidth = 0;
+    QScrollArea* mToolRail = nullptr;
     std::unique_ptr<android::base::RaiiEventListener<
             android::DisplayPowerModeNotificationSupport,
             android::DisplayPowerModeChangeEvent>>

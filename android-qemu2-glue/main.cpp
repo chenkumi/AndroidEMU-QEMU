@@ -814,6 +814,12 @@ private:
             // flush commands for nothing.
             driveParam += ",overlap-check=none,cache=unsafe";
 
+            // AndroidEMU: let guest TRIM release userdata clusters (virtio-blk
+            // discard + file-win32 hole punching); otherwise the overlay only grows.
+            if (type == IMAGE_TYPE_USER_DATA) {
+                driveParam += ",discard=unmap";
+            }
+
             // Default qcow2's L2 cache size is up to 8GB. Let's increase it for
             // larger images.
             System::FileSize diskSize;
@@ -2057,6 +2063,13 @@ extern "C" int main(int argc, char** argv) {
             feature_set_enabled_override(kFeature_QuickbootFileBacked, false);
         }
 
+        // A cold-only session cannot use an automatic RAM snapshot. Avoid
+        // allocating a guest-RAM-sized file that would only be mapped privately
+        // and never saved. Disk-image caching and flush policy are unchanged.
+        if (opts->no_snapshot_load && opts->no_snapshot_save) {
+            feature_set_enabled_override(kFeature_QuickbootFileBacked, false);
+        }
+
         // Situations where not to use mmap() for RAM
         // 1. Using HDD on Linux or macOS; no file mapping or we will have a bad
         // time.
@@ -2541,13 +2554,13 @@ extern "C" int main(int argc, char** argv) {
             if (dataPartitionPathAsDir &&
                 System::get()->pathFreeSpace(*dataPartitionPathAsDir,
                                              &availableSpace)) {
-                constexpr double kDataPartitionSafetyFactor = 1.2;
+                // The userdata qcow2 is thin-provisioned (and shrinks again
+                // through discard), so the configured partition size is a
+                // ceiling, not an allocation. Require a fixed working
+                // reserve instead of 1.2x the ceiling.
+                constexpr double kMinFreeBytes = 4.0 * 1024 * 1024 * 1024;
 
-                double needed = kDataPartitionSafetyFactor *
-                                getConsoleAgents()
-                                        ->settings->hw()
-                                        ->disk_dataPartition_size /
-                                (1024.0 * 1024.0);
+                double needed = kMinFreeBytes / (1024.0 * 1024.0);
 
                 double available = (double)availableSpace / (1024.0 * 1024.0);
 

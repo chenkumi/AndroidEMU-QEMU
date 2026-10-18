@@ -29,6 +29,39 @@
 #include "hw/virtio/virtio-bus.h"
 #include "hw/virtio/virtio-access.h"
 
+/*
+ * AndroidEMU: guest discard (TRIM) backported from QEMU 4.0, discard only (no
+ * write-zeroes). Offered only for drives opened with discard=unmap, so blocks
+ * the guest frees are released by qcow2 instead of staying allocated forever.
+ * Kept local to avoid changing the shared virtio_blk_config layout.
+ */
+#define VIRTIO_BLK_F_DISCARD 13
+#define VIRTIO_BLK_T_DISCARD 11
+/* qcow2's default cluster size; unaligned parts are ignored by the block layer. */
+#define VIRTIO_BLK_DISCARD_ALIGN_SECTORS 128
+
+struct virtio_blk_discard_config {
+    struct virtio_blk_config base;
+    uint32_t max_discard_sectors;
+    uint32_t max_discard_seg;
+    uint32_t discard_sector_alignment;
+    uint32_t max_write_zeroes_sectors;
+    uint32_t max_write_zeroes_seg;
+    uint8_t write_zeroes_may_unmap;
+    uint8_t unused1[3];
+} QEMU_PACKED;
+
+struct virtio_blk_discard_write_zeroes {
+    uint64_t sector;
+    uint32_t num_sectors;
+    uint32_t flags;
+} QEMU_PACKED;
+
+static bool virtio_blk_discard_enabled(VirtIOBlock *s)
+{
+    return !blk_is_read_only(s->blk) && (blk_get_flags(s->blk) & BDRV_O_UNMAP);
+}
+
 static void virtio_blk_init_request(VirtIOBlock *s, VirtQueue *vq,
                                     VirtIOBlockReq *req)
 {
@@ -458,6 +491,51 @@ static void virtio_blk_handle_flush(VirtIOBlockReq *req, MultiReqBuffer *mrb)
 }
 
 static bool virtio_blk_sect_range_ok(VirtIOBlock *dev,
+                                     uint64_t sector, size_t size);
+
+static void virtio_blk_discard_complete(void *opaque, int ret)
+{
+    VirtIOBlockReq *req = opaque;
+    VirtIOBlock *s = req->dev;
+
+    aio_context_acquire(blk_get_aio_context(s->conf.conf.blk));
+    if (ret) {
+        /* A failed discard leaves data in place; report it, never stop the VM. */
+        virtio_blk_req_complete(req, VIRTIO_BLK_S_IOERR);
+    } else {
+        virtio_blk_req_complete(req, VIRTIO_BLK_S_OK);
+    }
+    virtio_blk_free_request(req);
+    aio_context_release(blk_get_aio_context(s->conf.conf.blk));
+}
+
+/* Returns VIRTIO_BLK_S_OK when the request was submitted asynchronously. */
+static uint8_t virtio_blk_handle_discard(VirtIOBlockReq *req,
+                                         struct virtio_blk_discard_write_zeroes *hdr)
+{
+    VirtIOBlock *s = req->dev;
+    VirtIODevice *vdev = VIRTIO_DEVICE(s);
+    uint64_t sector = virtio_ldq_p(vdev, &hdr->sector);
+    uint32_t num_sectors = virtio_ldl_p(vdev, &hdr->num_sectors);
+    uint32_t flags = virtio_ldl_p(vdev, &hdr->flags);
+    size_t bytes;
+
+    if (!virtio_blk_discard_enabled(s) || flags) {
+        return VIRTIO_BLK_S_UNSUPP;
+    }
+    if (num_sectors > BDRV_REQUEST_MAX_SECTORS) {
+        return VIRTIO_BLK_S_IOERR;
+    }
+    bytes = (size_t)num_sectors << BDRV_SECTOR_BITS;
+    if (!virtio_blk_sect_range_ok(s, sector, bytes)) {
+        return VIRTIO_BLK_S_IOERR;
+    }
+    blk_aio_pdiscard(s->blk, sector << BDRV_SECTOR_BITS, bytes,
+                     virtio_blk_discard_complete, req);
+    return VIRTIO_BLK_S_OK;
+}
+
+static bool virtio_blk_sect_range_ok(VirtIOBlock *dev,
                                      uint64_t sector, size_t size)
 {
     uint64_t nb_sectors = size >> BDRV_SECTOR_BITS;
@@ -583,6 +661,30 @@ static int virtio_blk_handle_request(VirtIOBlockReq *req, MultiReqBuffer *mrb)
         iov_from_buf(in_iov, in_num, 0, serial, size);
         virtio_blk_req_complete(req, VIRTIO_BLK_S_OK);
         virtio_blk_free_request(req);
+        break;
+    }
+    case VIRTIO_BLK_T_DISCARD & ~VIRTIO_BLK_T_OUT:
+    {
+        struct virtio_blk_discard_write_zeroes hdr;
+        uint8_t status;
+
+        /* One segment per request (max_discard_seg = 1). */
+        if (unlikely(!(type & VIRTIO_BLK_T_OUT) ||
+                     iov_size(iov, out_num) != sizeof(hdr))) {
+            virtio_blk_req_complete(req, VIRTIO_BLK_S_UNSUPP);
+            virtio_blk_free_request(req);
+            return 0;
+        }
+        iov_to_buf(iov, out_num, 0, &hdr, sizeof(hdr));
+        /* Earlier merged reads/writes must not be reordered after the discard. */
+        if (mrb->num_reqs > 0) {
+            virtio_blk_submit_multireq(req->dev->blk, mrb);
+        }
+        status = virtio_blk_handle_discard(req, &hdr);
+        if (status != VIRTIO_BLK_S_OK) {
+            virtio_blk_req_complete(req, status);
+            virtio_blk_free_request(req);
+        }
         break;
     }
     default:
@@ -747,6 +849,7 @@ static void virtio_blk_update_config(VirtIODevice *vdev, uint8_t *config)
 {
     VirtIOBlock *s = VIRTIO_BLK(vdev);
     BlockConf *conf = &s->conf.conf;
+    struct virtio_blk_discard_config dcfg;
     struct virtio_blk_config blkcfg;
     uint64_t capacity;
     int64_t length;
@@ -783,7 +886,15 @@ static void virtio_blk_update_config(VirtIODevice *vdev, uint8_t *config)
     blkcfg.alignment_offset = 0;
     blkcfg.wce = blk_enable_write_cache(s->blk);
     virtio_stw_p(vdev, &blkcfg.num_queues, s->conf.num_queues);
-    memcpy(config, &blkcfg, sizeof(struct virtio_blk_config));
+    memset(&dcfg, 0, sizeof(dcfg));
+    dcfg.base = blkcfg;
+    if (virtio_blk_discard_enabled(s)) {
+        virtio_stl_p(vdev, &dcfg.max_discard_sectors, BDRV_REQUEST_MAX_SECTORS);
+        virtio_stl_p(vdev, &dcfg.max_discard_seg, 1);
+        virtio_stl_p(vdev, &dcfg.discard_sector_alignment,
+                     MAX(VIRTIO_BLK_DISCARD_ALIGN_SECTORS, blk_size >> BDRV_SECTOR_BITS));
+    }
+    memcpy(config, &dcfg, sizeof(dcfg));
 }
 
 static void virtio_blk_set_config(VirtIODevice *vdev, const uint8_t *config)
@@ -825,6 +936,9 @@ static uint64_t virtio_blk_get_features(VirtIODevice *vdev, uint64_t features,
     }
     if (blk_is_read_only(s->blk)) {
         virtio_add_feature(&features, VIRTIO_BLK_F_RO);
+    }
+    if (virtio_blk_discard_enabled(s)) {
+        virtio_add_feature(&features, VIRTIO_BLK_F_DISCARD);
     }
     if (s->conf.num_queues > 1) {
         virtio_add_feature(&features, VIRTIO_BLK_F_MQ);
@@ -976,7 +1090,7 @@ static void virtio_blk_device_realize(DeviceState *dev, Error **errp)
     }
 
     virtio_init(vdev, "virtio-blk", VIRTIO_ID_BLOCK,
-                sizeof(struct virtio_blk_config));
+                sizeof(struct virtio_blk_discard_config));
 
     s->blk = conf->conf.blk;
     s->rq = NULL;

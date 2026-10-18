@@ -1,4 +1,14 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="48px" height="48px" viewBox="0 0 48 48" fill="#617D8A">
-    <path d="M38 26H10v-4h28v4z"/>
-    <path d="M0 0h48v48H0z" fill="none"/>
+<svg
+  class="lucide lucide-minus"
+  xmlns="http://www.w3.org/2000/svg"
+  width="24"
+  height="24"
+  viewBox="0 0 24 24"
+  fill="none"
+  stroke="#617D8A"
+  stroke-width="2"
+  stroke-linecap="round"
+  stroke-linejoin="round"
+>
+  <path d="M5 12h14" />
 </svg>

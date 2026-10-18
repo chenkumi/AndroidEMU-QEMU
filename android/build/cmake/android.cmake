@@ -56,6 +56,13 @@ endfunction()
 # the project. OUT_PATH Name of the variable that will contain the resulting
 # executable.
 function(android_compile_for_host EXE SOURCE OUT_PATH)
+  if(WIN32 AND EXE STREQUAL "nasm" AND AEMU_NASM_EXECUTABLE)
+    if(NOT EXISTS "${AEMU_NASM_EXECUTABLE}")
+      message(FATAL_ERROR "Missing configured native NASM: ${AEMU_NASM_EXECUTABLE}")
+    endif()
+    set(${OUT_PATH} "${AEMU_NASM_EXECUTABLE}" PARENT_SCOPE)
+    return()
+  endif()
   if(NOT CROSSCOMPILE)
     # We can add this project without any translation..
     if(NOT TARGET ${EXE})
@@ -1518,6 +1525,12 @@ function(android_build_qemu_variant)
   # Make the common dependency explicit, as some generators might not detect it
   # properly (Xcode/MSVC native)
   add_dependencies(${qemu_build_EXE} qemu2-common)
+  # Whole-archive flags on MSVC do not create a Ninja file dependency.
+  # Relink the executable when its common runtime archive changes.
+  if(WIN32)
+    set_property(TARGET ${qemu_build_EXE} APPEND PROPERTY LINK_DEPENDS
+                 "$<TARGET_FILE:qemu2-common>")
+  endif()
   android_sign(TARGET ${qemu_build_EXE})
 
   # XCode bin places this not where we want this...
@@ -1761,11 +1774,21 @@ endif()
 function(android_symlink TARGET SYMLINK WORKDIR)
   file(MAKE_DIRECTORY ${WORKDIR})
   if(WIN32 AND NOT CROSSCOMPILE)
+    if(EXISTS "${WORKDIR}/${SYMLINK}")
+      return()
+    endif()
     # message("Creating symlink,  mklink ${WIN_PATH} ${WIN_TGT}")
     file(TO_NATIVE_PATH "${TARGET}" WIN_TGT)
     file(TO_NATIVE_PATH "${WORKDIR}/${SYMLINK}" WIN_PATH)
-    execute_process(COMMAND cmd.exe /c mklink ${WIN_PATH} ${WIN_TGT}
-                    WORKING_DIRECTORY ${WORKDIR})
+    if(IS_DIRECTORY "${TARGET}")
+      execute_process(COMMAND cmd.exe /c mklink /J "${WIN_PATH}" "${WIN_TGT}"
+                      WORKING_DIRECTORY "${WORKDIR}" RESULT_VARIABLE LINK_RESULT)
+      if(NOT LINK_RESULT EQUAL 0)
+        message(FATAL_ERROR "Unable to create native directory junction: ${WIN_PATH}")
+      endif()
+    else()
+      file(CREATE_LINK "${TARGET}" "${WORKDIR}/${SYMLINK}" COPY_ON_ERROR)
+    endif()
   else()
     # message("Creating symlink, create_symlink: ${WORKDIR}/${SYMLINK} ->
     # ${TARGET}")

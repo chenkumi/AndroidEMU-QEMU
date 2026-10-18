@@ -99,8 +99,10 @@ class WindowsEnvironment(BaseEnvironment):
                 str(
                     prgrfiles / "Microsoft Visual Studio" / "Installer" / "vswhere.exe"
                 ),
+                "-products",
+                "*",
                 "-requires",
-                "Microsoft.VisualStudio.Workload.NativeDesktop",
+                "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
                 "-sort",
                 "-format",
                 "json",

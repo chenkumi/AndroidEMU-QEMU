@@ -372,6 +372,25 @@ static void glue (audio_close_, TYPE) (SW *sw)
 {
     glue (audio_pcm_sw_fini_, TYPE) (sw);
     glue (audio_pcm_hw_del_sw_, TYPE) (sw);
+#ifdef DAC
+    HW *hw = sw->hw;
+    if (hw->sw_head.lh_first) {
+        SW *peer;
+        int idle = 1;
+        for (peer = hw->sw_head.lh_first; peer; peer = peer->entries.le_next) {
+            if (peer->active || peer->total_hw_samples_mixed != 0) {
+                idle = 0;
+                break;
+            }
+        }
+        if (idle) {
+            /* An idle peer can keep HW alive after the last playing voice is
+             * closed. Its orphaned mix must not be added to the next voice.
+             * Leave backend disable timing unchanged and retain every peer's PCM. */
+            mixeng_clear(hw->mix_buf, hw->samples);
+        }
+    }
+#endif
     glue (audio_pcm_hw_gc_, TYPE) (&sw->hw);
     g_free (sw);
 }
