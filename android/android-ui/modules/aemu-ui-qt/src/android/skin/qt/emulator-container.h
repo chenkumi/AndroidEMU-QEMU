@@ -15,6 +15,7 @@
 #include <qobjectdefs.h>                   // for Q_OBJECT, signals, slots
 #include <QEvent>                          // for QEvent
 #include <QList>                           // for QList
+#include <QRect>
 #include <QScrollArea>                     // for QScrollArea
 #include <QSize>                           // for QSize
 #include <QString>                         // for QString
@@ -53,6 +54,7 @@ public:
     void changeEvent(QEvent* event) override;
     void closeEvent(QCloseEvent* event) override;
     bool event(QEvent* e) override;
+    bool eventFilter(QObject* obj, QEvent* e) override;
     void focusInEvent(QFocusEvent* event) override;
     void focusOutEvent(QFocusEvent* event) override;
     void keyPressEvent(QKeyEvent* event) override;
@@ -100,6 +102,8 @@ private slots:
 
 private:
     void startResizeTimer();
+    QRect displayArea() const;
+    void placeScrollBars();
     void adjustModalOverlayGeometry();
     void adjustVirtualSceneDialogGeometry();
     void adjustMessagesOverlayGeometry();

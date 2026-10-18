@@ -349,6 +349,7 @@ void EmulatorContainer::changeEvent(QEvent* event) {
             if (mToolRail) {
                 mToolRail->setVisible(!isFullScreen());
                 setViewportMargins(0, 0, isFullScreen() ? 0 : mToolRailWidth, 0);
+                placeScrollBars();
             }
             break;
 
@@ -437,6 +438,7 @@ void EmulatorContainer::resizeEvent(QResizeEvent* event) {
         mToolRail->setGeometry(width() - mToolRailWidth, 0, mToolRailWidth, height());
         static_cast<IntegratedToolRail*>(mToolRail)->fitTools();
     }
+    placeScrollBars();
     mEmulatorWindow->simulateZoomedWindowResized(this->viewportSize());
     adjustModalOverlayGeometry();
     adjustVirtualSceneDialogGeometry();
@@ -596,6 +598,9 @@ void EmulatorContainer::attachToolWindow(ToolWindow* tools) {
     mToolRail->setGeometry(width() - mToolRailWidth, 0, mToolRailWidth, height());
     static_cast<IntegratedToolRail*>(mToolRail)->fitTools();
     mToolRail->show();
+    verticalScrollBar()->parentWidget()->installEventFilter(this);
+    horizontalScrollBar()->parentWidget()->installEventFilter(this);
+    placeScrollBars();
     QTimer::singleShot(1000, this, [this, tools] {
         for (auto button : tools->findChildren<QPushButton*>()) {
             if (!button->isVisible()) continue;
@@ -770,16 +775,47 @@ void EmulatorContainer::startResizeTimer() {
 #endif
 }
 
+// Global rectangle of the emulator display area (the viewport, which excludes the integrated tool rail).
+QRect EmulatorContainer::displayArea() const {
+    if (mIntegratedUi) return QRect(viewport()->mapToGlobal(QPoint()), viewport()->size());
+    return QRect(mapToGlobal(QPoint()), size());
+}
+
+// The zoom scrollbars belong to the display area: keep them at the edge of the viewport, left of the tool rail.
+// A file-local guard, not a member: the header is shared and inline accessors depend on its layout.
+static bool sPlacingScrollBars = false;
+
+void EmulatorContainer::placeScrollBars() {
+    if (!mToolRail || sPlacingScrollBars) return;
+    sPlacingScrollBars = true;
+    // QAbstractScrollArea wraps each scrollbar in a container widget that it lays out itself; move the container.
+    QWidget* v = verticalScrollBar()->parentWidget();
+    QWidget* h = horizontalScrollBar()->parentWidget();
+    const int right = width() - (isFullScreen() ? 0 : mToolRailWidth);
+    const int vw = v->width(), hh = h->height();
+    if (v->isVisible()) v->setGeometry(right - vw, 0, vw, height() - (h->isVisible() ? hh : 0));
+    if (h->isVisible()) h->setGeometry(0, height() - hh, right - (v->isVisible() ? vw : 0), hh);
+    sPlacingScrollBars = false;
+}
+
+bool EmulatorContainer::eventFilter(QObject* obj, QEvent* e) {
+    if (mToolRail && (obj == verticalScrollBar()->parentWidget() || obj == horizontalScrollBar()->parentWidget()) &&
+        (e->type() == QEvent::Move || e->type() == QEvent::Resize || e->type() == QEvent::Show)) {
+        placeScrollBars();
+    }
+    return QScrollArea::eventFilter(obj, e);
+}
+
 void EmulatorContainer::adjustModalOverlayGeometry() {
     if (!mModalOverlay) {
         return;
     }
 
-    auto overlaySize = QSize(std::min(300, width()), std::min(300, height()));
-    mModalOverlay->resize(overlaySize, size());
-    mModalOverlay->move(
-            mapToGlobal(QPoint((width() - mModalOverlay->width()) / 2,
-                               (height() - mModalOverlay->height()) / 2)));
+    // Center on the emulator display, not on the whole window: the tool rail takes space on the right.
+    const QRect area = displayArea();
+    auto overlaySize = QSize(std::min(300, area.width()), std::min(300, area.height()));
+    mModalOverlay->resize(overlaySize, area.size());
+    mModalOverlay->move(area.center() - QPoint(mModalOverlay->width() / 2, mModalOverlay->height() / 2));
 }
 
 void EmulatorContainer::adjustVirtualSceneDialogGeometry() {
@@ -804,8 +840,8 @@ void EmulatorContainer::adjustMessagesOverlayGeometry() {
                                          (width() - 2 * 150 * scaleFactor)));
     mMessages->setFixedWidth(w);
     mMessages->adjustSize();
-    mMessages->move(mapToGlobal(QPoint()) +=
-                    {(width() - mMessages->width()) / 2, 0});
+    const QRect area = displayArea();
+    mMessages->move(area.topLeft() + QPoint((area.width() - mMessages->width()) / 2, 0));
 }
 
 void EmulatorContainer::adjustGlassesStatusOverlayGeometry() {
