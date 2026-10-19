@@ -1086,5 +1086,8 @@
         <file alias="posture_tent_0BA">images/all/posture_tent_0BA.svg</file>
         <!-- Used in Embedded Emulator -->
         <file alias="android_studio_icon">images/all/androidstudio.svg</file>
+        <!-- Terrarium application icon (window and taskbar) -->
+        <file alias="terrarium_icon">images/all/terrarium_icon.png</file>
+        <file alias="terrarium_icon_32">images/all/terrarium_icon_32.png</file>
     </qresource>
 </RCC>

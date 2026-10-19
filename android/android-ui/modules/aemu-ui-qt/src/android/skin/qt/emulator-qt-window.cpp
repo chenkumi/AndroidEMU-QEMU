@@ -100,6 +100,7 @@
 #include <QMouseEvent>
 #include <QPainter>
 #include <QPixmap>
+#include <QRegularExpression>
 #include <QProgressBar>
 #include <QPushButton>
 #include <QScreen>
@@ -2493,16 +2494,30 @@ void EmulatorQtWindow::slot_setWindowIcon(const unsigned char* data,
                                           int size,
                                           QSemaphore* semaphore) {
     QSemaphoreReleaser semReleaser(semaphore);
-    QPixmap image;
-    image.loadFromData(data, size);
-    QIcon icon(image);
+    // Terrarium shows its own icon; the emulator's default icon is used only if the resource is missing.
+    QIcon icon;
+    icon.addFile(":/all/terrarium_icon_32");
+    icon.addFile(":/all/terrarium_icon");
+    if (icon.isNull()) {
+        QPixmap image;
+        image.loadFromData(data, size);
+        icon = QIcon(image);
+    }
     QApplication::setWindowIcon(icon);
+}
+
+// "Android Emulator - AndroidEMU_default:5582" -> "Terrarium - default:5582". Other titles pass through unchanged.
+static QString productWindowTitle(const QString& title) {
+    static const QRegularExpression pattern(QStringLiteral("^Android Emulator - (?:AndroidEMU_)?(.+):(\\d+)$"));
+    const QRegularExpressionMatch match = pattern.match(title);
+    if (!match.hasMatch()) return title;
+    return QStringLiteral("Terrarium - %1:%2").arg(match.captured(1), match.captured(2));
 }
 
 void EmulatorQtWindow::slot_setWindowTitle(QString title,
                                            QSemaphore* semaphore) {
     QSemaphoreReleaser semReleaser(semaphore);
-    mBaseWindowTitle = title;
+    mBaseWindowTitle = productWindowTitle(title);
     updateWindowTitle();
 
     (*mAdbInterface)->setSerialNumberPort(
